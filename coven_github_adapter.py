@@ -1,11 +1,13 @@
 import base64
 import hashlib
+import hmac
 import json
 import os
 import subprocess
 import tempfile
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
@@ -23,6 +25,9 @@ PRIVATE_KEY_PATH = Path(
     os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", ROOT_DIR / ".coven-github-private-key.pem")
 )
 APP_ID = os.environ.get("GITHUB_APP_ID", "").strip()
+WEBHOOK_SECRET = (
+    os.environ.get("GITHUB_WEBHOOK_SECRET") or os.environ.get("WEBHOOK_SECRET", "")
+).strip()
 COVEN_CODE_BIN = os.environ.get("COVEN_CODE_BIN", "coven-code").strip() or "coven-code"
 COVEN_CODE_MODEL = os.environ.get("COVEN_CODE_MODEL", "gpt-5.5").strip()
 
@@ -180,6 +185,77 @@ def task_path(task_id):
     return TASKS_DIR / (task_id + ".json")
 
 
+def header(environ, name, default=""):
+    key = "HTTP_" + name.upper().replace("-", "_")
+    return environ.get(key, default)
+
+
+def json_response(start_response, status, body):
+    payload = json.dumps(body, sort_keys=True).encode("utf-8")
+    start_response(
+        status,
+        [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(payload))),
+        ],
+    )
+    return [payload]
+
+
+def read_request_body(environ):
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or "0")
+    except ValueError:
+        length = 0
+    return environ["wsgi.input"].read(length)
+
+
+def verify_webhook_signature(secret, body, signature_header):
+    if not secret:
+        return False, "webhook secret not configured"
+    if not signature_header:
+        return False, "missing signature"
+    prefix = "sha256="
+    if not signature_header.startswith(prefix):
+        return False, "invalid signature"
+    expected = prefix + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature_header):
+        return False, "invalid signature"
+    return True, None
+
+
+def application(environ, start_response):
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+    path = environ.get("PATH_INFO", "/")
+    if method == "GET" and path in ("/", "/healthz"):
+        return json_response(start_response, "200 OK", {"ok": True})
+    if method != "POST" or path not in ("/", "/webhook"):
+        return json_response(start_response, "404 Not Found", {"error": "not found"})
+
+    body = read_request_body(environ)
+    ok, error = verify_webhook_signature(
+        WEBHOOK_SECRET,
+        body,
+        header(environ, "X-Hub-Signature-256"),
+    )
+    if not ok:
+        status = "500 Internal Server Error" if error == "webhook secret not configured" else "401 Unauthorized"
+        return json_response(start_response, status, {"error": error})
+
+    event_name = header(environ, "X-GitHub-Event")
+    if not event_name:
+        return json_response(start_response, "400 Bad Request", {"error": "missing event"})
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return json_response(start_response, "400 Bad Request", {"error": "invalid json"})
+
+    delivery_id = header(environ, "X-GitHub-Delivery") or str(uuid.uuid4())
+    result = route_delivery(event_name, delivery_id, payload, lambda message: print(message, flush=True))
+    return json_response(start_response, "200 OK", result)
+
+
 def payload_hash(payload):
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -222,7 +298,7 @@ def labels_include_trigger(labels, policy):
 def build_task_from_event(event_name, delivery_id, payload, policy):
     repository = payload.get("repository") or {}
     installation = payload.get("installation") or {}
-    familiar = policy.get("familiar") or DEFAULT_POLICY["installations"]["144638200"]["repositories"]["1290307745"]["familiar"]
+    familiar = policy.get("familiar")
     base = {
         "task_id": delivery_id,
         "delivery_id": delivery_id,
@@ -240,6 +316,8 @@ def build_task_from_event(event_name, delivery_id, payload, policy):
         "publication": policy.get("publication") or {"mode": "record_only"},
         "issue_refs": ["OpenCoven/coven-github#2", "OpenCoven/coven-github#7"],
     }
+    if not familiar:
+        return ignored(base, "missing_familiar_policy")
 
     if event_name == "issue_comment":
         issue = payload.get("issue") or {}

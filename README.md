@@ -22,6 +22,7 @@ reproduced, and changed through PRs instead of server-only edits.
 The deployment expects secrets and mutable state to be supplied outside git:
 
 - `GITHUB_APP_ID`
+- `GITHUB_WEBHOOK_SECRET` or `WEBHOOK_SECRET`
 - `GITHUB_APP_PRIVATE_KEY_PATH` or `.coven-github-private-key.pem`
 - `COVEN_GITHUB_STATE_DIR`
 - `COVEN_GITHUB_POLICY_PATH`
@@ -32,6 +33,20 @@ The deployment expects secrets and mutable state to be supplied outside git:
 
 Do not commit private keys, webhook secrets, OAuth tokens, generated task state,
 workspaces, or attempt artifacts.
+
+## Local smoke test
+
+Run the adapter behind any WSGI server that points at
+`coven_github_adapter:application`, then verify signature handling:
+
+```bash
+WEBHOOK_SECRET="replace-with-local-secret" \
+  scripts/smoke-webhook.sh http://localhost:3000/webhook
+```
+
+The smoke test proves that unsigned requests and bad signatures are rejected,
+while a correctly HMAC-signed GitHub `ping` delivery is accepted without needing
+`coven-code` or a GitHub installation token.
 
 ## Policy
 
