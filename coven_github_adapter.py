@@ -30,6 +30,7 @@ WEBHOOK_SECRET = (
 ).strip()
 COVEN_CODE_BIN = os.environ.get("COVEN_CODE_BIN", "coven-code").strip() or "coven-code"
 COVEN_CODE_MODEL = os.environ.get("COVEN_CODE_MODEL", "gpt-5.5").strip()
+MAX_WEBHOOK_BODY_BYTES = 10 * 1024 * 1024
 
 
 def env_int(name, default, minimum=0, maximum=10):
@@ -202,12 +203,24 @@ def json_response(start_response, status, body):
     return [payload]
 
 
+class PayloadTooLarge(Exception):
+    pass
+
+
 def read_request_body(environ):
+    raw_length = (environ.get("CONTENT_LENGTH") or "").strip()
     try:
-        length = int(environ.get("CONTENT_LENGTH") or "0")
+        length = int(raw_length) if raw_length else -1
     except ValueError:
-        length = 0
-    return environ["wsgi.input"].read(length)
+        length = -1
+    if length > MAX_WEBHOOK_BODY_BYTES:
+        raise PayloadTooLarge
+    if length > 0:
+        return environ["wsgi.input"].read(length)
+    body = environ["wsgi.input"].read(MAX_WEBHOOK_BODY_BYTES + 1)
+    if len(body) > MAX_WEBHOOK_BODY_BYTES:
+        raise PayloadTooLarge
+    return body
 
 
 def verify_webhook_signature(secret, body, signature_header):
@@ -215,6 +228,7 @@ def verify_webhook_signature(secret, body, signature_header):
         return False, "webhook secret not configured"
     if not signature_header:
         return False, "missing signature"
+    signature_header = signature_header.strip()
     prefix = "sha256="
     if not signature_header.startswith(prefix):
         return False, "invalid signature"
@@ -232,7 +246,10 @@ def application(environ, start_response):
     if method != "POST" or path not in ("/", "/webhook"):
         return json_response(start_response, "404 Not Found", {"error": "not found"})
 
-    body = read_request_body(environ)
+    try:
+        body = read_request_body(environ)
+    except PayloadTooLarge:
+        return json_response(start_response, "413 Payload Too Large", {"error": "payload too large"})
     ok, error = verify_webhook_signature(
         WEBHOOK_SECRET,
         body,
