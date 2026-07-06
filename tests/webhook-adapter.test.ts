@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -292,4 +292,48 @@ test("missing familiar policy does not fall back to hardcoded installation", () 
 
   assert.equal(task.state, "ignored");
   assert.equal(task.ignored_reason, "missing_familiar_policy");
+});
+
+test("example policy routes a labeled issue to the configured familiar", () => {
+  const policyFile = new URL("../config/example-policy.json", import.meta.url);
+  const policyRoot = JSON.parse(readFileSync(policyFile, "utf8")) as JsonObject;
+  const installation = (policyRoot.installations as JsonObject)["123456"] as JsonObject;
+  const policy = ((installation.repositories as JsonObject)["987654321"]) as JsonObject;
+
+  const task = buildTaskFromEvent(
+    "issues",
+    "delivery-example-policy",
+    {
+      action: "labeled",
+      installation: {id: 123456},
+      repository: {
+        id: 987654321,
+        full_name: "OpenCoven/example",
+        clone_url: "https://github.com/OpenCoven/example.git",
+        default_branch: "main",
+      },
+      issue: {
+        number: 42,
+        title: "Wire the app",
+        body: "Make the first app route functional.",
+        labels: [{name: "coven:fix"}],
+      },
+    } as JsonObject,
+    policy,
+  );
+
+  assert.equal(task.state, "queued");
+  assert.equal(task.trigger, "issue_mention");
+  assert.deepEqual(task.task, {
+    kind: "fix_issue",
+    issue_number: 42,
+    issue_title: "Wire the app",
+    issue_body: "Make the first app route functional.",
+  });
+  assert.deepEqual(task.familiar, {
+    id: "cody",
+    display_name: "Cody",
+    model: "openai/gpt-5.5",
+    skills: ["systematic-debugging", "test-driven-development"],
+  });
 });

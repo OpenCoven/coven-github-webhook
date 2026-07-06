@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "installations": {
+    "123456": {
+      "repositories": {
+        "987654321": {
+          "enabled_triggers": [
+            "issues.labeled",
+            "issue_comment.created",
+            "pull_request_review_comment.created"
+          ],
+          "trigger_labels": [
+            "coven:fix",
+            "coven:review"
+          ],
+          "bot_usernames": [
+            "coven-cody[bot]"
+          ],
+          "default_branch": "main",
+          "familiar": {
+            "id": "cody",
+            "display_name": "Cody",
+            "model": "openai/gpt-5.5",
+            "skills": [
+              "systematic-debugging",
+              "test-driven-development"
+            ]
+          },
+          "publication": {
+            "mode": "record_only"
+          }
+        }
+      }
+    }
+  }
+}
