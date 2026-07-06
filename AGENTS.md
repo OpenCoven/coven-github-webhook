@@ -24,8 +24,9 @@ pull requests against this repo. This is the agent-specific layer; read
 
 ## Before opening the PR
 
-- If you touched Python, keep it runnable on the target host: no new heavy deps
-  unless the deployment target supports them, and don't break the entrypoint.
+- If you touched TypeScript, keep it runnable on the target host: avoid heavy
+  runtime dependencies unless the deployment target supports them, and don't
+  break the Node entrypoint.
 - Smoke-test the webhook handler locally where possible (a signed sample
   payload) before relying on the hosted deploy.
 
