@@ -149,6 +149,27 @@ class WebhookAdapterTests(unittest.TestCase):
             self.assertEqual(status, "200 OK")
             self.assertTrue(payload["ok"])
 
+    def test_webhook_treats_zero_content_length_as_empty_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            secret = "zero-length-secret"
+            adapter = import_adapter(Path(tmp), secret)
+
+            status, payload = self.call_app(
+                adapter,
+                b'{"zen":"Keep it logically awesome."}',
+                {
+                    "X-GitHub-Event": "ping",
+                    "X-GitHub-Delivery": "delivery-zero-length",
+                    "X-Hub-Signature-256": signature(secret, b""),
+                },
+                content_length=0,
+            )
+
+            self.assertEqual(status, "400 Bad Request")
+            self.assertEqual(payload["error"], "invalid json")
+
     def test_webhook_rejects_oversized_content_length_before_signature_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             from pathlib import Path
