@@ -17,6 +17,10 @@ reproduced, and changed through PRs instead of server-only edits.
 - `src/server.ts` - Node HTTP entrypoint for `/`, `/healthz`, and `/webhook`.
 - `tests/webhook-adapter.test.ts` - parity coverage for signature handling,
   request body edge cases, and task routing guards.
+- `config/example-policy.json` - example installation/repository policy that
+  connects a GitHub App install to a familiar route.
+- `docs/coven-github-connection.md` - operator guide for connecting this
+  TypeScript deployment bundle to the canonical `coven-github` app manifest.
 - `scripts/smoke-webhook.sh` - local HMAC signature smoke test for a running
   webhook endpoint.
 
@@ -86,6 +90,10 @@ The default checked-in policy is empty:
 Deployments should provide `coven-github-policy.json` through
 `COVEN_GITHUB_POLICY_PATH`. That file is intentionally ignored because it is
 environment-specific.
+
+Start from [`config/example-policy.json`](config/example-policy.json) and the
+connection guide in
+[`docs/coven-github-connection.md`](docs/coven-github-connection.md).
 
 ## Current behavior
 
