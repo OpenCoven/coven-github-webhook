@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/server.js",
     "dev": "tsx src/server.ts",
+    "smoke:app": "npm run build && node scripts/demo-app-smoke.mjs",
     "test": "node --import tsx --test tests/*.test.ts"
   },
   "devDependencies": {

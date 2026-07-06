@@ -23,6 +23,7 @@ export interface AdapterConfig {
   maxReviewFixLoops: number;
   codexTokensPath: string;
   maxWebhookBodyBytes: number;
+  demoMode: boolean;
 }
 
 export interface AdapterRequest {
@@ -78,6 +79,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env, rootDir = pro
     maxReviewFixLoops: envInt(env.COVEN_REVIEW_FIX_LOOPS, 0, 0, 5),
     codexTokensPath: configuredCodexTokensPath(env),
     maxWebhookBodyBytes: MAX_WEBHOOK_BODY_BYTES,
+    demoMode: ["1", "true", "yes"].includes((env.COVEN_GITHUB_DEMO_MODE || "").trim().toLowerCase()),
   };
 
   for (const directory of [config.deliveriesDir, config.tasksDir, config.workspacesDir, config.attemptsDir]) {
@@ -787,6 +789,10 @@ async function runTask(config: AdapterConfig, taskId: string): Promise<JsonObjec
   const workspace = join(config.workspacesDir, taskId, "repo");
 
   try {
+    if (config.demoMode) {
+      return completeDemoTask(path, task, workspace, attemptDir);
+    }
+
     const token = await installationToken(config, task.installation_id);
     const askpass = writeAskpass(attemptDir);
     const env: NodeJS.ProcessEnv = {
@@ -883,6 +889,48 @@ async function runTask(config: AdapterConfig, taskId: string): Promise<JsonObjec
   } catch (error) {
     return failTask(path, task, "infra_error", String((error as Error).stack || error));
   }
+}
+
+function completeDemoTask(path: string, task: JsonObject, workspace: string, attemptDir: string): JsonObject {
+  mkdirSync(workspace, {recursive: true});
+  const briefPath = join(attemptDir, "session-brief.json");
+  const resultPath = join(attemptDir, "result.json");
+  writeJsonAtomic(briefPath, sessionBrief(task, workspace, null));
+  writeJsonAtomic(resultPath, {
+    contract_version: "2",
+    status: "success",
+    summary: "Demo mode accepted a signed GitHub delivery, matched policy, and created a familiar task without external GitHub or coven-code calls.",
+    files_changed: [],
+    commits: [],
+    review: {
+      mode: "demo",
+      evidence_status: "signed_delivery_policy_route",
+      reviewed_files: [],
+      supporting_files: [],
+      findings: [],
+      tests_run: [
+        {
+          command: "COVEN_GITHUB_DEMO_MODE=1 signed issues.labeled delivery",
+          status: "passed",
+          output_summary: "Webhook signature verified and example policy routed to familiar task.",
+        },
+      ],
+      limitations: [
+        "Demo mode does not mint GitHub installation tokens, clone repositories, run coven-code, or publish GitHub comments.",
+      ],
+    },
+  });
+
+  task.state = "completed";
+  task.demo_mode = true;
+  task.runtime_exit_code = 0;
+  task.session_brief_path = briefPath;
+  task.session_brief_sha256 = fileSha256(briefPath);
+  task.result_path = resultPath;
+  task.publication_state = "demo_mode_no_github_calls";
+  task.updated_at = utcNow();
+  writeJsonAtomic(path, task);
+  return task;
 }
 
 function commandExists(command: string): boolean {

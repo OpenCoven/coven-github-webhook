@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -336,4 +336,63 @@ test("example policy routes a labeled issue to the configured familiar", () => {
     model: "openai/gpt-5.5",
     skills: ["systematic-debugging", "test-driven-development"],
   });
+});
+
+test("demo mode handles a signed labeled issue without external GitHub calls", async () => {
+  const secret = "demo-route-secret";
+  const stateDir = tempStateDir();
+  const policyPath = join(stateDir, "policy.json");
+  writeFileSync(
+    policyPath,
+    readFileSync(new URL("../config/example-policy.json", import.meta.url)),
+  );
+  const config = createConfig(
+    {
+      COVEN_GITHUB_DEMO_MODE: "1",
+      COVEN_GITHUB_STATE_DIR: stateDir,
+      COVEN_GITHUB_POLICY_PATH: policyPath,
+      GITHUB_WEBHOOK_SECRET: secret,
+    },
+    process.cwd(),
+  );
+  const body = Buffer.from(JSON.stringify({
+    action: "labeled",
+    installation: {id: 123456},
+    repository: {
+      id: 987654321,
+      full_name: "OpenCoven/example",
+      clone_url: "https://github.com/OpenCoven/example.git",
+      default_branch: "main",
+    },
+    issue: {
+      number: 42,
+      title: "Wire the app",
+      body: "Make the first app route functional.",
+      labels: [{name: "coven:fix"}],
+    },
+  }));
+
+  const response = await callWebhook(
+    body,
+    {
+      "X-GitHub-Event": "issues",
+      "X-GitHub-Delivery": "delivery-demo-mode",
+      "X-Hub-Signature-256": signature(secret, body),
+    },
+    "auto",
+    config,
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.action, "accepted");
+  assert.equal(response.body.state, "completed");
+
+  const taskPath = join(stateDir, "tasks", "delivery-demo-mode.json");
+  assert.equal(existsSync(taskPath), true);
+  const task = JSON.parse(readFileSync(taskPath, "utf8")) as JsonObject;
+  assert.equal(task.state, "completed");
+  assert.equal(task.demo_mode, true);
+  assert.equal(task.publication_state, "demo_mode_no_github_calls");
+  assert.equal(existsSync(String(task.session_brief_path)), true);
+  assert.equal(existsSync(String(task.result_path)), true);
 });
