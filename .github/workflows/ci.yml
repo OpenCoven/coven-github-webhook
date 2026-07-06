@@ -31,3 +31,6 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      - name: App route smoke
+        run: node scripts/demo-app-smoke.mjs

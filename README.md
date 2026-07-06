@@ -21,6 +21,8 @@ reproduced, and changed through PRs instead of server-only edits.
   connects a GitHub App install to a familiar route.
 - `docs/coven-github-connection.md` - operator guide for connecting this
   TypeScript deployment bundle to the canonical `coven-github` app manifest.
+- `scripts/demo-app-smoke.mjs` - local signed-delivery demo for the example
+  policy route.
 - `scripts/smoke-webhook.sh` - local HMAC signature smoke test for a running
   webhook endpoint.
 
@@ -77,6 +79,7 @@ while a correctly HMAC-signed GitHub `ping` delivery is accepted without needing
 ```bash
 npm test
 npm run build
+npm run smoke:app
 ```
 
 ## Policy
@@ -98,6 +101,9 @@ connection guide in
 ## Current behavior
 
 - Emits headless contract v2 session briefs.
+- Supports explicit `COVEN_GITHUB_DEMO_MODE=1` local app smoke runs that verify
+  signed delivery -> policy route -> delivery/task/result state without calling
+  GitHub or `coven-code`.
 - Captures PR checkout metadata and changed-file patches before invoking
   `coven-code`.
 - Publishes visible structured review evidence, including `reviewed_files`,

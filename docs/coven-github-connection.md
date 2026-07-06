@@ -91,6 +91,23 @@ WEBHOOK_SECRET="$GITHUB_WEBHOOK_SECRET" \
 That proves the HTTP endpoint and HMAC signature path before any GitHub token or
 runtime work is attempted.
 
+## Local App Demo
+
+Before creating a real GitHub App, run the self-contained demo:
+
+```bash
+npm run smoke:app
+```
+
+The demo starts the built Node server on localhost, signs an `issues.labeled`
+payload with the same `sha256=` HMAC format GitHub uses, loads
+`config/example-policy.json`, and prints the resulting delivery, task, session
+brief, and result paths.
+
+It runs with `COVEN_GITHUB_DEMO_MODE=1`. That mode is intentionally explicit:
+it verifies the app ingress and routing path, but does not mint GitHub
+installation tokens, clone repositories, run `coven-code`, or publish comments.
+
 ## Functional App Smoke
 
 On a repository where the App is installed:
