@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+*.pem
+*.key
+keys/
+coven-github-policy.json
+coven-github-state/
+.coven-github-private-key.pem
