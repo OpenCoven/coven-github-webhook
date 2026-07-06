@@ -33,15 +33,18 @@ def signature(secret, body):
 
 
 class WebhookAdapterTests(unittest.TestCase):
-    def call_app(self, adapter, body, headers=None):
+    def call_app(self, adapter, body, headers=None, content_length="auto"):
         headers = headers or {}
         status_headers = []
         environ = {
             "REQUEST_METHOD": "POST",
             "PATH_INFO": "/webhook",
-            "CONTENT_LENGTH": str(len(body)),
             "wsgi.input": io.BytesIO(body),
         }
+        if content_length == "auto":
+            environ["CONTENT_LENGTH"] = str(len(body))
+        elif content_length is not None:
+            environ["CONTENT_LENGTH"] = str(content_length)
         for name, value in headers.items():
             environ["HTTP_" + name.upper().replace("-", "_")] = value
 
@@ -101,6 +104,110 @@ class WebhookAdapterTests(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["action"], "ignored")
             self.assertEqual(payload["reason"], "no_policy_for_installation_repo")
+
+    def test_webhook_reads_body_when_content_length_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            secret = "missing-length-secret"
+            adapter = import_adapter(Path(tmp), secret)
+            body = b'{"zen":"Keep it logically awesome."}'
+
+            status, payload = self.call_app(
+                adapter,
+                body,
+                {
+                    "X-GitHub-Event": "ping",
+                    "X-GitHub-Delivery": "delivery-missing-length",
+                    "X-Hub-Signature-256": signature(secret, body),
+                },
+                content_length=None,
+            )
+
+            self.assertEqual(status, "200 OK")
+            self.assertTrue(payload["ok"])
+
+    def test_webhook_reads_body_when_content_length_is_unparsable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            secret = "bad-length-secret"
+            adapter = import_adapter(Path(tmp), secret)
+            body = b'{"zen":"Keep it logically awesome."}'
+
+            status, payload = self.call_app(
+                adapter,
+                body,
+                {
+                    "X-GitHub-Event": "ping",
+                    "X-GitHub-Delivery": "delivery-bad-length",
+                    "X-Hub-Signature-256": signature(secret, body),
+                },
+                content_length="not-a-number",
+            )
+
+            self.assertEqual(status, "200 OK")
+            self.assertTrue(payload["ok"])
+
+    def test_webhook_rejects_oversized_content_length_before_signature_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            adapter = import_adapter(Path(tmp))
+            status, payload = self.call_app(
+                adapter,
+                b"",
+                {
+                    "X-GitHub-Event": "ping",
+                    "X-GitHub-Delivery": "delivery-large-body",
+                    "X-Hub-Signature-256": "sha256=deadbeef",
+                },
+                content_length=10 * 1024 * 1024 + 1,
+            )
+
+            self.assertEqual(status, "413 Payload Too Large")
+            self.assertEqual(payload["error"], "payload too large")
+
+    def test_webhook_signature_allows_surrounding_whitespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            secret = "whitespace-secret"
+            adapter = import_adapter(Path(tmp), secret)
+            body = b'{"zen":"Keep it logically awesome."}'
+
+            status, payload = self.call_app(
+                adapter,
+                body,
+                {
+                    "X-GitHub-Event": "ping",
+                    "X-GitHub-Delivery": "delivery-whitespace-signature",
+                    "X-Hub-Signature-256": " " + signature(secret, body) + " ",
+                },
+            )
+
+            self.assertEqual(status, "200 OK")
+            self.assertTrue(payload["ok"])
+
+    def test_webhook_reports_missing_secret_as_server_misconfiguration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+
+            adapter = import_adapter(Path(tmp), "")
+            body = b'{"zen":"Keep it logically awesome."}'
+
+            status, payload = self.call_app(
+                adapter,
+                body,
+                {
+                    "X-GitHub-Event": "ping",
+                    "X-GitHub-Delivery": "delivery-missing-secret",
+                    "X-Hub-Signature-256": signature("ignored", body),
+                },
+            )
+
+            self.assertEqual(status, "500 Internal Server Error")
+            self.assertEqual(payload["error"], "webhook secret not configured")
 
     def test_webhook_secret_supports_smoke_script_environment_name(self):
         with tempfile.TemporaryDirectory() as tmp:
