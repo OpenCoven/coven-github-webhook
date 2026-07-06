@@ -34,7 +34,23 @@ After creating the App, keep these values outside git:
 
 - App ID -> `GITHUB_APP_ID`
 - Webhook secret -> `GITHUB_WEBHOOK_SECRET`
-- Private key PEM path -> `GITHUB_APP_PRIVATE_KEY_PATH`
+- Private key PEM -> `GITHUB_APP_PRIVATE_KEY`, or private key PEM path ->
+  `GITHUB_APP_PRIVATE_KEY_PATH`
+
+For 1Password-backed local runs, copy
+`.env.1password.example` to an ignored local env file and update the `op://`
+references to the fields in your item:
+
+```bash
+cp .env.1password.example .env.1password.local
+```
+
+Then run commands through 1Password without exposing secret values:
+
+```bash
+op run --env-file .env.1password.local -- npm run doctor:app
+op run --env-file .env.1password.local -- npm start
+```
 
 ## Policy
 
@@ -78,6 +94,7 @@ export COVEN_GITHUB_POLICY_PATH="$PWD/coven-github-policy.json"
 export COVEN_GITHUB_STATE_DIR="$PWD/coven-github-state"
 export COVEN_CODE_BIN="$(command -v coven-code)"
 
+npm run doctor:app
 npm start
 ```
 

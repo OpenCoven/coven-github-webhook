@@ -16,6 +16,7 @@ export interface AdapterConfig {
   attemptsDir: string;
   policyPath: string;
   privateKeyPath: string;
+  privateKeyPem: string;
   appId: string;
   webhookSecret: string;
   covenCodeBin: string;
@@ -72,6 +73,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env, rootDir = pro
     attemptsDir: join(stateDir, "attempts"),
     policyPath: resolve(env.COVEN_GITHUB_POLICY_PATH || join(rootDir, "coven-github-policy.json")),
     privateKeyPath: resolve(env.GITHUB_APP_PRIVATE_KEY_PATH || join(rootDir, ".coven-github-private-key.pem")),
+    privateKeyPem: (env.GITHUB_APP_PRIVATE_KEY || "").trim(),
     appId: (env.GITHUB_APP_ID || "").trim(),
     webhookSecret: (env.GITHUB_WEBHOOK_SECRET || env.WEBHOOK_SECRET || "").trim(),
     covenCodeBin: (env.COVEN_CODE_BIN || "coven-code").trim() || "coven-code",
@@ -181,7 +183,7 @@ function githubAppJwt(config: AdapterConfig): string {
   const header = {alg: "RS256", typ: "JWT"};
   const payload = {iat: now - 60, exp: now + 540, iss: config.appId};
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
-  const privateKey = readFileSync(config.privateKeyPath, "utf8");
+  const privateKey = config.privateKeyPem || readFileSync(config.privateKeyPath, "utf8");
   const signature = createSign("RSA-SHA256").update(signingInput).sign(privateKey);
   return `${signingInput}.${b64url(signature)}`;
 }

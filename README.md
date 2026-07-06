@@ -79,6 +79,7 @@ while a correctly HMAC-signed GitHub `ping` delivery is accepted without needing
 ```bash
 npm test
 npm run build
+npm run doctor:app
 npm run smoke:app
 ```
 

@@ -268,6 +268,17 @@ test("webhook secret supports smoke script environment name", async () => {
   assert.equal(response.body.ok, true);
 });
 
+test("config accepts an inline GitHub App private key from env", () => {
+  const config = createConfig(
+    {
+      GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\nexample\n-----END PRIVATE KEY-----",
+    },
+    process.cwd(),
+  );
+
+  assert.equal(config.privateKeyPem, "-----BEGIN PRIVATE KEY-----\nexample\n-----END PRIVATE KEY-----");
+});
+
 test("missing familiar policy does not fall back to hardcoded installation", () => {
   const task = buildTaskFromEvent(
     "issues",
