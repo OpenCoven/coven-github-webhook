@@ -215,7 +215,7 @@ def read_request_body(environ):
         length = -1
     if length > MAX_WEBHOOK_BODY_BYTES:
         raise PayloadTooLarge
-    if length > 0:
+    if length >= 0:
         return environ["wsgi.input"].read(length)
     body = environ["wsgi.input"].read(MAX_WEBHOOK_BODY_BYTES + 1)
     if len(body) > MAX_WEBHOOK_BODY_BYTES:
