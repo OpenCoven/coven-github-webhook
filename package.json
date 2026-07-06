@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "doctor:app": "npm run build && node scripts/doctor-app-config.mjs",
     "start": "node dist/src/server.js",
     "dev": "tsx src/server.ts",
     "smoke:app": "npm run build && node scripts/demo-app-smoke.mjs",
