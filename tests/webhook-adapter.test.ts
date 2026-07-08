@@ -9,6 +9,7 @@ import {
   buildTaskFromEvent,
   createConfig,
   handleRequest,
+  publicationCommentBody,
   type JsonObject,
 } from "../src/adapter.js";
 
@@ -347,6 +348,135 @@ test("example policy routes a labeled issue to the configured familiar", () => {
     model: "openai/gpt-5.5",
     skills: ["systematic-debugging", "test-driven-development"],
   });
+});
+
+test("publication body links screenshot-style file mentions to GitHub blobs", () => {
+  const body = publicationCommentBody(
+    {
+      task_id: "task-file-links",
+      repository: "OpenCoven/coven-github-webhook",
+      default_branch: "main",
+      review_evidence: {
+        head_sha: "abc123def456",
+      },
+    },
+    {
+      status: "success",
+      summary: [
+        "### Files inspected",
+        "",
+        "- `src/lib/server/skills-directory.ts`",
+        "- `Read src/lib/server/skill-scan.ts`",
+        "- Read src/lib/server/skill-scan.ts - passed: inspected adapter implementation.",
+        "- Read AGENTS.md - passed: reviewed guidance.",
+        "- Fixed a bug, e.g. the parser broke.",
+        "- In other words, i.e. no bogus abbreviation links.",
+        "- Mentioned foo.bar.baz.qux in prose.",
+        "- Grep for https://github.com/OpenCoven/coven-github-webhook/blob/main/src/adapter.ts and tests_run[].output_summary.",
+        "- `README.md:12`",
+        "- `README.md:12-14`",
+        "- `tests_run[].output_summary`",
+        "- `pnpm test`",
+        "",
+        "```ts",
+        "`src/not-linked-inside-fence.ts`",
+        "```",
+      ].join("\n"),
+      review: {
+        supporting_files: ["AGENTS.md"],
+      },
+    },
+  );
+
+  assert.match(
+    body,
+    /\[`src\/lib\/server\/skills-directory\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skills-directory\.ts\)/,
+  );
+  assert.match(
+    body,
+    /`Read` \[`src\/lib\/server\/skill-scan\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skill-scan\.ts\)/,
+  );
+  assert.match(
+    body,
+    /Read \[`src\/lib\/server\/skill-scan\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skill-scan\.ts\) - passed/,
+  );
+  assert.match(
+    body,
+    /Read \[`AGENTS\.md`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/AGENTS\.md\) - passed/,
+  );
+  assert.match(body, /https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/main\/src\/adapter\.ts/);
+  assert.match(body, /e\.g\. the parser broke/);
+  assert.match(body, /i\.e\. no bogus abbreviation links/);
+  assert.match(body, /foo\.bar\.baz\.qux in prose/);
+  assert.doesNotMatch(body, /\[`e\.g`\]/);
+  assert.doesNotMatch(body, /\[`i\.e`\]/);
+  assert.doesNotMatch(body, /\[`foo\.bar\.baz\.qux`\]/);
+  assert.match(
+    body,
+    /\[`README\.md:12`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/README\.md#L12\)/,
+  );
+  assert.match(
+    body,
+    /\[`README\.md:12-14`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/README\.md#L12-L14\)/,
+  );
+  assert.match(body, /- `pnpm test`/);
+  assert.match(body, /- `tests_run\[\]\.output_summary`/);
+  assert.doesNotMatch(body, /\[`tests_run\[\]\.output_summary`\]/);
+  assert.doesNotMatch(body, /blob\/main\/\[`src\/adapter\.ts`\]/);
+  assert.match(body, /`src\/not-linked-inside-fence\.ts`/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-inside-fence\.ts`\]/);
+});
+
+test("publication body links structured review file lists and findings", () => {
+  const body = publicationCommentBody(
+    {
+      task_id: "task-structured-links",
+      repository: "OpenCoven/coven-github-webhook",
+      default_branch: "main",
+      review_evidence: {
+        head_sha: "feedface",
+        changed_files: ["src/app.ts"],
+        changed_file_count: 1,
+      },
+    },
+    {
+      status: "success",
+      summary: "Done.",
+      review: {
+        mode: "review",
+        evidence_status: "complete",
+        reviewed_files: ["src/app.ts"],
+        supporting_files: ["tests/app.test.ts"],
+        findings: [
+          {
+            severity: "medium",
+            file: "src/app.ts",
+            line: 7,
+            title: "Example finding",
+          },
+        ],
+        no_findings_reason: "Checked `tests/app.test.ts` with `npm test`.",
+        tests_run: [
+          {
+            command: "Read src/app.ts",
+            status: "passed",
+            output_summary: "inspected `tests/app.test.ts` coverage.",
+          },
+          {
+            command: "npm test",
+            status: "passed",
+          },
+        ],
+      },
+    },
+  );
+
+  assert.match(body, /\[`src\/app\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/app\.ts\)/);
+  assert.match(body, /\[`tests\/app\.test\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/tests\/app\.test\.ts\)/);
+  assert.match(body, /\[`src\/app\.ts:7`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/app\.ts#L7\)/);
+  assert.match(body, /`Read` \[`src\/app\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/app\.ts\): `passed`/);
+  assert.match(body, /with `npm test`/);
+  assert.match(body, /- `npm test`: `passed`/);
 });
 
 test("demo mode handles a signed labeled issue without external GitHub calls", async () => {

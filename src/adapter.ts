@@ -1092,15 +1092,16 @@ async function publishResultIfConfigured(task: JsonObject, resultPath: string, t
   }
 }
 
-function publicationCommentBody(task: JsonObject, result: JsonObject): string {
+export function publicationCommentBody(task: JsonObject, result: JsonObject): string {
   const status = result.status || "unknown";
-  const summary = String(result.summary || "No summary returned.");
-  const prBody = String(result.pr_body || "");
   const filesChanged = Array.isArray(result.files_changed) ? result.files_changed : [];
   const commits = Array.isArray(result.commits) ? result.commits : [];
   const taskId = String(task.task_id || "");
   const evidence = (task.review_evidence as JsonObject | undefined) || {};
   const review = (result.review as JsonObject | undefined) || {};
+  const knownFiles = githubKnownFileSet(task, review);
+  const summary = linkGithubFileMentions(task, String(result.summary || "No summary returned."), knownFiles);
+  const prBody = linkGithubFileMentions(task, String(result.pr_body || ""), knownFiles);
   const parts = ["## Cody dogfood result", "", `**Status:** ${status}`, "", summary.trim()];
   if (prBody.trim() && prBody.trim() !== summary.trim()) {
     parts.push("", prBody.trim());
@@ -1117,12 +1118,12 @@ function publicationCommentBody(task: JsonObject, result: JsonObject): string {
       `- Review context SHA-256: \`${evidence.review_context_sha256}\``,
     );
     if (changedFiles.length) {
-      parts.push(`- Files: ${changedFiles.slice(0, 20).map((file) => `\`${file}\``).join(", ")}`);
+      parts.push(`- Files: ${changedFiles.slice(0, 20).map((file) => githubFileMarkdown(task, String(file))).join(", ")}`);
     }
   } else {
     parts.push("- No PR review evidence was captured for this run.");
   }
-  parts.push(...structuredReviewLines(review));
+  parts.push(...structuredReviewLines(review, task, knownFiles));
   parts.push(
     "",
     `**Files changed:** ${filesChanged.length}`,
@@ -1131,6 +1132,171 @@ function publicationCommentBody(task: JsonObject, result: JsonObject): string {
     `_Task \`${taskId}\`. Publication is enabled on the hosted test adapter only._`,
   );
   return parts.join("\n");
+}
+
+function githubBlobBase(task: JsonObject): string | null {
+  const repository = String(task.repository || "").trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+    return null;
+  }
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const ref = String(evidence.head_sha || evidence.workspace_head_sha || task.default_branch || "").trim();
+  if (!ref) {
+    return null;
+  }
+  const encodedRef = encodeURIComponent(ref).replaceAll("%2F", "/");
+  return `https://github.com/${repository}/blob/${encodedRef}`;
+}
+
+function parseRepoRelativePath(rawPath: string): {display: string; path: string; line: number | null; endLine: number | null} | null {
+  const display = rawPath.trim();
+  if (!display || display !== rawPath || /[\s<>\[\]]/.test(display)) {
+    return null;
+  }
+  if (/^[\\/]/.test(display) || /^[A-Za-z]:[\\/]/.test(display)) {
+    return null;
+  }
+
+  let path = display.replaceAll("\\", "/");
+  let line: number | null = null;
+  let endLine: number | null = null;
+  const lineMatch = /^(.*):(\d+)(?:-(\d+))?$/.exec(path);
+  if (lineMatch) {
+    path = lineMatch[1];
+    line = Number(lineMatch[2]);
+    endLine = lineMatch[3] ? Number(lineMatch[3]) : null;
+  }
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)) {
+    return null;
+  }
+  while (path.startsWith("./")) {
+    path = path.slice(2);
+  }
+  const segments = path.split("/");
+  const filename = segments.at(-1) || "";
+  if (
+    !path ||
+    path.includes("//") ||
+    segments.some((segment) => !segment || segment === "." || segment === "..") ||
+    !/\.[A-Za-z][A-Za-z0-9._-]{0,15}$/.test(filename)
+  ) {
+    return null;
+  }
+  return {display, path, line, endLine};
+}
+
+function githubFileMarkdown(task: JsonObject, rawPath: string, lineOverride: number | null = null): string {
+  const target = parseRepoRelativePath(rawPath);
+  const base = githubBlobBase(task);
+  if (!target || !base) {
+    return `\`${rawPath}\``;
+  }
+  const encodedPath = target.path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  const line = lineOverride ?? target.line;
+  const endLine = lineOverride === null ? target.endLine : null;
+  const lineAnchor = line !== null && Number.isFinite(line) && line > 0
+    ? `#L${line}${endLine !== null && Number.isFinite(endLine) && endLine > line ? `-L${endLine}` : ""}`
+    : "";
+  return `[\`${target.display}\`](${base}/${encodedPath}${lineAnchor})`;
+}
+
+function githubKnownFileSet(task: JsonObject, review: JsonObject = {}): Set<string> {
+  const knownFiles = new Set<string>();
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const addFiles = (value: JsonValue | undefined) => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    for (const item of value) {
+      const target = parseRepoRelativePath(String(item));
+      if (target) {
+        knownFiles.add(target.path);
+      }
+    }
+  };
+  addFiles(evidence.changed_files);
+  addFiles(review.reviewed_files);
+  addFiles(review.supporting_files);
+  return knownFiles;
+}
+
+function inlineCodeWithGithubFileLinks(task: JsonObject, rawText: string): string {
+  const direct = githubFileMarkdown(task, rawText);
+  if (direct !== `\`${rawText}\``) {
+    return direct;
+  }
+
+  let linkedAny = false;
+  const parts = rawText.split(/(\s+)/).map((part) => {
+    if (!part || /^\s+$/.test(part)) {
+      return part;
+    }
+    const linked = githubFileMarkdown(task, part);
+    if (linked !== `\`${part}\``) {
+      linkedAny = true;
+      return linked;
+    }
+    return `\`${part}\``;
+  });
+
+  return linkedAny ? parts.join("") : `\`${rawText}\``;
+}
+
+function bareFileMentionAllowed(task: JsonObject, rawPath: string, knownFiles: Set<string>): boolean {
+  const target = parseRepoRelativePath(rawPath);
+  if (!target) {
+    return false;
+  }
+  return target.path.includes("/") || knownFiles.has(target.path);
+}
+
+function linkBareGithubFileMentions(task: JsonObject, text: string, knownFiles: Set<string>): string {
+  const markdownLinkPattern = /(\[[^\]]+\]\([^)]+\))/g;
+  const barePathPattern = /(^|[^\w./:[\]()`-])([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.[A-Za-z][A-Za-z0-9_-]{0,15}(?::\d+(?:-\d+)?)?)(?=$|[^\w/-])/g;
+  return text
+    .split(markdownLinkPattern)
+    .map((segment, index) => {
+      if (index % 2 === 1) {
+        return segment;
+      }
+      return segment.replace(barePathPattern, (match, prefix: string, rawPath: string) => {
+        if (!bareFileMentionAllowed(task, rawPath, knownFiles)) {
+          return match;
+        }
+        const linked = githubFileMarkdown(task, rawPath);
+        return linked === `\`${rawPath}\`` ? match : `${prefix}${linked}`;
+      });
+    })
+    .join("");
+}
+
+function linkGithubFileMentions(task: JsonObject, text: string, knownFiles: Set<string> = githubKnownFileSet(task)): string {
+  const fencePattern = /(```[\s\S]*?```)/g;
+  return text
+    .split(fencePattern)
+    .map((segment, index) => {
+      if (index % 2 === 1) {
+        return segment;
+      }
+      const linkedInlineCode = segment.replace(/`([^`\n]+)`/g, (match, rawPath: string, offset: number) => {
+        const alreadyLinkText = segment[offset - 1] === "[" && segment.slice(offset + match.length, offset + match.length + 2) === "](";
+        if (alreadyLinkText) {
+          return match;
+        }
+        const linked = inlineCodeWithGithubFileLinks(task, rawPath);
+        return linked === `\`${rawPath}\`` ? match : linked;
+      });
+      return linkBareGithubFileMentions(task, linkedInlineCode, knownFiles);
+    })
+    .join("");
+}
+
+function reviewTestCommandMarkdown(task: JsonObject, rawCommand: string): string {
+  const command = rawCommand.trim();
+  if (!command) {
+    return "`unknown command`";
+  }
+  return inlineCodeWithGithubFileLinks(task, command);
 }
 
 function reviewFixLoopLines(task: JsonObject): string[] {
@@ -1148,7 +1314,7 @@ function reviewFixLoopLines(task: JsonObject): string[] {
   return lines;
 }
 
-function structuredReviewLines(review: JsonObject): string[] {
+function structuredReviewLines(review: JsonObject, task: JsonObject, knownFiles: Set<string> = githubKnownFileSet(task, review)): string[] {
   if (!Object.keys(review).length) {
     return ["", "### Structured review", "- No structured review result was emitted."];
   }
@@ -1162,7 +1328,7 @@ function structuredReviewLines(review: JsonObject): string[] {
   const reviewedFiles = Array.isArray(review.reviewed_files) ? review.reviewed_files : [];
   lines.push(`- Reviewed files: ${reviewedFiles.length}`);
   if (reviewedFiles.length) {
-    lines.push(`- Reviewed file list: ${reviewedFiles.slice(0, 20).map((path) => `\`${path}\``).join(", ")}`);
+    lines.push(`- Reviewed file list: ${reviewedFiles.slice(0, 20).map((path) => githubFileMarkdown(task, String(path))).join(", ")}`);
     if (reviewedFiles.length > 20) {
       lines.push("- Reviewed file list truncated after 20 entries.");
     }
@@ -1170,7 +1336,7 @@ function structuredReviewLines(review: JsonObject): string[] {
   const supportingFiles = Array.isArray(review.supporting_files) ? review.supporting_files : [];
   lines.push(`- Supporting files inspected: ${supportingFiles.length}`);
   if (supportingFiles.length) {
-    lines.push(`- Supporting file list: ${supportingFiles.slice(0, 20).map((path) => `\`${path}\``).join(", ")}`);
+    lines.push(`- Supporting file list: ${supportingFiles.slice(0, 20).map((path) => githubFileMarkdown(task, String(path))).join(", ")}`);
     if (supportingFiles.length > 20) {
       lines.push("- Supporting file list truncated after 20 entries.");
     }
@@ -1182,19 +1348,21 @@ function structuredReviewLines(review: JsonObject): string[] {
     if (finding.line !== undefined && finding.line !== null) {
       location = `${location}:${finding.line}`;
     }
-    lines.push(`  ${index + 1}. \`${finding.severity || "unknown"}\` ${location} - ${finding.title || "Untitled finding"}`);
+    const linkedLocation = githubFileMarkdown(task, location, Number(finding.line || 0) || null);
+    lines.push(`  ${index + 1}. \`${finding.severity || "unknown"}\` ${linkedLocation} - ${finding.title || "Untitled finding"}`);
   });
   if (findings.length > 10) {
     lines.push("- Findings truncated after 10 entries.");
   }
   if (review.no_findings_reason) {
-    lines.push(`- No-findings reason: ${review.no_findings_reason}`);
+    lines.push(`- No-findings reason: ${linkGithubFileMentions(task, String(review.no_findings_reason), knownFiles)}`);
   }
   const testsRun = Array.isArray(review.tests_run) ? (review.tests_run as JsonObject[]) : [];
   lines.push(`- Tests reported by runtime: ${testsRun.length}`);
   testsRun.slice(0, 10).forEach((item) => {
-    const summary = item.output_summary ? ` - ${item.output_summary}` : "";
-    lines.push(`  - \`${item.command || "unknown command"}\`: \`${item.status || "unknown"}\`${summary}`);
+    const command = reviewTestCommandMarkdown(task, String(item.command || "unknown command"));
+    const summary = item.output_summary ? ` - ${linkGithubFileMentions(task, String(item.output_summary), knownFiles)}` : "";
+    lines.push(`  - ${command}: \`${item.status || "unknown"}\`${summary}`);
   });
   if (testsRun.length > 10) {
     lines.push("- Test list truncated after 10 entries.");
