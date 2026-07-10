@@ -335,7 +335,7 @@ test("example policy routes a labeled issue to the configured familiar", () => {
   );
 
   assert.equal(task.state, "queued");
-  assert.equal(task.trigger, "issue_mention");
+  assert.equal(task.trigger, "issue_assigned");
   assert.deepEqual(task.task, {
     kind: "fix_issue",
     issue_number: 42,
@@ -348,6 +348,49 @@ test("example policy routes a labeled issue to the configured familiar", () => {
     model: "openai/gpt-5.5",
     skills: ["systematic-debugging", "test-driven-development"],
   });
+});
+
+test("new issue creation is ignored unless a supported trigger is enabled", () => {
+  const task = buildTaskFromEvent(
+    "issues",
+    "delivery-issue-opened",
+    {
+      action: "opened",
+      installation: {id: 123456},
+      repository: {
+        id: 987654321,
+        full_name: "OpenCoven/example",
+        clone_url: "https://github.com/OpenCoven/example.git",
+        default_branch: "main",
+      },
+      issue: {
+        number: 43,
+        title: "Installer is slow",
+        body: "A diagnostic issue, not a bot task.",
+        labels: [],
+        assignees: [],
+      },
+    } as JsonObject,
+    {
+      enabled_triggers: [
+        "issues.labeled",
+        "issue_comment.created",
+        "pull_request_review_comment.created",
+      ],
+      trigger_labels: ["coven:fix"],
+      bot_usernames: ["coven-cody[bot]"],
+      familiar: {
+        id: "cody",
+        display_name: "Cody",
+        model: "openai/gpt-5.5",
+        skills: [],
+      },
+      publication: {mode: "record_only"},
+    } as JsonObject,
+  );
+
+  assert.equal(task.state, "ignored");
+  assert.equal(task.ignored_reason, "unsupported_issue_action");
 });
 
 test("publication body links screenshot-style file mentions to GitHub blobs", () => {

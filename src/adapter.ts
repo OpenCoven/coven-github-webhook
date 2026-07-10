@@ -404,6 +404,36 @@ function labelsIncludeTrigger(labels: JsonValue | undefined, policy: JsonObject)
   return false;
 }
 
+function issueAssignedToBot(issue: JsonObject, policy: JsonObject): boolean {
+  const wanted = new Set(((policy.bot_usernames as JsonValue[]) || []).map((username) => String(username).toLowerCase()));
+  if (wanted.size === 0) {
+    return false;
+  }
+  const assignees: JsonValue[] = [];
+  if (issue.assignee) {
+    assignees.push(issue.assignee);
+  }
+  if (Array.isArray(issue.assignees)) {
+    assignees.push(...issue.assignees);
+  }
+  for (const assignee of assignees) {
+    const login = typeof assignee === "object" && assignee !== null && !Array.isArray(assignee)
+      ? String((assignee as JsonObject).login || "")
+      : String(assignee);
+    if (wanted.has(login.toLowerCase())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function triggerEnabled(policy: JsonObject, trigger: string): boolean {
+  if (policy.enabled_triggers === undefined) {
+    return true;
+  }
+  return new Set(((policy.enabled_triggers as JsonValue[]) || []).map((value) => String(value))).has(trigger);
+}
+
 export function buildTaskFromEvent(
   eventName: string,
   deliveryId: string,
@@ -437,6 +467,12 @@ export function buildTaskFromEvent(
   if (eventName === "issue_comment") {
     const issue = (payload.issue as JsonObject | undefined) || {};
     const comment = (payload.comment as JsonObject | undefined) || {};
+    if (payload.action !== "created") {
+      return ignored(base, "unsupported_issue_comment_action");
+    }
+    if (!triggerEnabled(policy, "issue_comment.created")) {
+      return ignored(base, "issue_comment_not_enabled");
+    }
     if (!mentioned(comment.body, policy)) {
       return ignored(base, "issue_comment_without_mention");
     }
@@ -468,6 +504,12 @@ export function buildTaskFromEvent(
   if (eventName === "pull_request_review_comment") {
     const comment = (payload.comment as JsonObject | undefined) || {};
     const pullRequest = (payload.pull_request as JsonObject | undefined) || {};
+    if (payload.action !== "created") {
+      return ignored(base, "unsupported_pr_review_comment_action");
+    }
+    if (!triggerEnabled(policy, "pull_request_review_comment.created")) {
+      return ignored(base, "pr_review_comment_not_enabled");
+    }
     if (!mentioned(comment.body, policy)) {
       return ignored(base, "pr_review_comment_without_mention");
     }
@@ -492,14 +534,23 @@ export function buildTaskFromEvent(
   if (eventName === "issues") {
     const issue = (payload.issue as JsonObject | undefined) || {};
     const action = payload.action;
-    if (action !== "assigned" && action !== "labeled" && action !== "opened") {
+    if (action !== "assigned" && action !== "labeled") {
       return ignored(base, "unsupported_issue_action");
+    }
+    if (action === "assigned" && !triggerEnabled(policy, "issues.assigned")) {
+      return ignored(base, "issue_assigned_not_enabled");
+    }
+    if (action === "assigned" && !issueAssignedToBot(issue, policy)) {
+      return ignored(base, "issue_assigned_to_unmanaged_user");
+    }
+    if (action === "labeled" && !triggerEnabled(policy, "issues.labeled")) {
+      return ignored(base, "issue_label_not_enabled");
     }
     if (action === "labeled" && !labelsIncludeTrigger(issue.labels, policy)) {
       return ignored(base, "issue_label_not_enabled");
     }
     Object.assign(base, {
-      trigger: action === "assigned" ? "issue_assigned" : "issue_mention",
+      trigger: "issue_assigned",
       task: {
         kind: "fix_issue",
         issue_number: Number(issue.number || 0),
