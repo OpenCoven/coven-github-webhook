@@ -9,8 +9,53 @@ import {
   buildTaskFromEvent,
   createConfig,
   handleRequest,
+  normalizeReviewPublication,
+  publishResultIfConfigured,
   type JsonObject,
 } from "../src/adapter.js";
+
+async function withGithubApiMock<T>(handler: (url: string, init: RequestInit) => JsonObject, work: () => Promise<T>): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (input, init) => new Response(JSON.stringify(handler(String(input), init || {})), {status: 200});
+  try {
+    return await work();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+function reviewTask(taskId = "review-task"): JsonObject {
+  return {
+    task_id: taskId,
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    target: {kind: "pull_request", pr_number: 7},
+    task: {pr_number: 7},
+    review_evidence: {
+      head_sha: "abc123",
+      changed_files: ["src/app.ts", "tests/app.test.ts"],
+      changed_file_lines: [{path: "src/app.ts", right_lines: [12]}],
+    },
+  };
+}
+
+function completeReview(findings: JsonObject[] = []): JsonObject {
+  return {
+    status: "success",
+    summary: "Reviewed the pull request.",
+    files_changed: [],
+    commits: [],
+    review: {
+      mode: "pull_request",
+      evidence_status: "complete",
+      reviewed_files: ["src/app.ts"],
+      supporting_files: ["tests/app.test.ts"],
+      findings,
+      tests_run: [{command: "npm test", status: "passed", output_summary: "all tests passed"}],
+      limitations: [],
+    },
+  };
+}
 
 function tempStateDir(): string {
   return mkdtempSync(join(tmpdir(), "coven-github-webhook-"));
@@ -406,4 +451,125 @@ test("demo mode handles a signed labeled issue without external GitHub calls", a
   assert.equal(task.publication_state, "demo_mode_no_github_calls");
   assert.equal(existsSync(String(task.session_brief_path)), true);
   assert.equal(existsSync(String(task.result_path)), true);
+});
+
+test("publishes a native change-request review with inline findings and skips a retry", async () => {
+  const stateDir = tempStateDir();
+  const config = testConfig(stateDir);
+  const task = reviewTask();
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify(completeReview([{
+    severity: "high",
+    file: "src/app.ts",
+    line: 12,
+    title: "Validate input",
+    body: "The request is accepted without validation.",
+    recommendation: "Reject malformed input.",
+  }])));
+  const calls: Array<{url: string; init: RequestInit}> = [];
+
+  await withGithubApiMock((url, init) => {
+    calls.push({url, init});
+    return {id: 101, html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-101"};
+  }, async () => {
+    await publishResultIfConfigured(config, task, resultPath, "token");
+    await publishResultIfConfigured(config, task, resultPath, "token");
+  });
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/pulls\/7\/reviews$/);
+  const body = JSON.parse(String(calls[0].init.body)) as JsonObject;
+  assert.equal(body.event, "REQUEST_CHANGES");
+  assert.equal((body.comments as JsonObject[]).length, 1);
+  assert.equal(task.publication_state, "publication_skipped_duplicate");
+  assert.equal(task.publication_review_id, 101);
+});
+
+test("approves only a complete no-findings PR review", () => {
+  const normalized = normalizeReviewPublication(reviewTask(), completeReview());
+  assert.equal(normalized.evidenceComplete, true);
+  assert.equal(normalized.decision, "APPROVE");
+});
+
+test("uses COMMENT for contradictory evidence and includes validation and GitHub file links", async () => {
+  const task = reviewTask();
+  const result = completeReview();
+  const review = result.review as JsonObject;
+  review.tests_run = [{command: "npm test", status: "passed", output_summary: "not run"}];
+  result.summary = "npm test - not run";
+  const normalized = normalizeReviewPublication(task, result);
+
+  assert.equal(normalized.decision, "COMMENT");
+  assert.equal(normalized.evidenceComplete, false);
+  assert.match(normalized.validationIssues.join("\n"), /contradictory/);
+
+  const stateDir = tempStateDir();
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify(result));
+  let published = "";
+  await withGithubApiMock((_url, init) => {
+    published = String(init.body);
+    return {id: 102, html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-102"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+  assert.match(published, /"event":"COMMENT"/);
+  assert.match(published, /Publication validation/);
+  assert.match(published, /https:\/\/github\.com\/OpenCoven\/example\/blob\/abc123\/src\/app\.ts/);
+});
+
+test("a newer review names the prior covencat publication as superseded", async () => {
+  const stateDir = tempStateDir();
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify(completeReview()));
+  const bodies: string[] = [];
+  let id = 200;
+  await withGithubApiMock((_url, init) => {
+    bodies.push(String(init.body));
+    id += 1;
+    return {id, html_url: `https://github.com/OpenCoven/example/pull/7#pullrequestreview-${id}`};
+  }, async () => {
+    await publishResultIfConfigured(testConfig(stateDir), reviewTask("first-run"), resultPath, "token");
+    await publishResultIfConfigured(testConfig(stateDir), reviewTask("newer-run"), resultPath, "token");
+  });
+
+  assert.equal(bodies.length, 2);
+  assert.match(bodies[1], /supersedes/);
+  assert.match(bodies[1], /pullrequestreview-201/);
+});
+
+test("keeps a finding in the review body when its line is not in the captured diff", async () => {
+  const stateDir = tempStateDir();
+  const task = reviewTask("invalid-inline-location");
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify(completeReview([{severity: "high", file: "src/app.ts", line: 99, title: "Out-of-diff finding"}])));
+  let published = "";
+  await withGithubApiMock((_url, init) => {
+    published = String(init.body);
+    return {id: 250, html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-250"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+  const body = JSON.parse(published) as JsonObject;
+  assert.equal(body.comments, undefined);
+  assert.match(String(body.body), /Findings without valid inline locations/);
+});
+
+test("keeps non-PR task results as idempotent issue comments", async () => {
+  const stateDir = tempStateDir();
+  const task: JsonObject = {
+    task_id: "issue-task",
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    task: {issue_number: 11},
+  };
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify({status: "failure", summary: "Runtime was unavailable.", files_changed: [], commits: []}));
+  const methods: string[] = [];
+  await withGithubApiMock((_url, init) => {
+    methods.push(String(init.method));
+    return {id: 301, html_url: "https://github.com/OpenCoven/example/issues/11#issuecomment-301"};
+  }, async () => {
+    await publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token");
+    await publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token");
+  });
+  assert.deepEqual(methods, ["POST", "PATCH"]);
+  assert.equal(task.publication_comment_id, 301);
 });

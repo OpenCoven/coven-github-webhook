@@ -107,9 +107,17 @@ connection guide in
   GitHub or `coven-code`.
 - Captures PR checkout metadata and changed-file patches before invoking
   `coven-code`.
-- Publishes visible structured review evidence, including `reviewed_files`,
-  `supporting_files`, findings, test evidence, no-findings rationale, and
-  limitations.
+- Publishes PR results as native GitHub reviews: complete no-finding evidence
+  approves, actionable findings request changes, and incomplete or
+  contradictory evidence is published as a comment review. Findings are made
+  inline only when their captured diff location is valid; all other findings
+  remain in the review body.
+- Persists publication identities and review/comment IDs in the configured
+  state directory so retries do not duplicate output and a newer review links
+  to the prior covencat publication it supersedes.
+- Publishes non-PR task results and operational notices as issue comments,
+  including structured `reviewed_files`, `supporting_files`, findings, test
+  evidence, no-findings rationale, and limitations.
 - When `COVEN_REVIEW_FIX_LOOPS` is greater than `0`, reruns `coven-code` with
   prior structured review findings as explicit repair instructions until no
   findings remain or the configured loop count is exhausted.

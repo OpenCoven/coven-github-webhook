@@ -12,6 +12,7 @@ export interface AdapterConfig {
   stateDir: string;
   deliveriesDir: string;
   tasksDir: string;
+  publicationsDir: string;
   workspacesDir: string;
   attemptsDir: string;
   policyPath: string;
@@ -69,6 +70,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env, rootDir = pro
     stateDir,
     deliveriesDir: join(stateDir, "deliveries"),
     tasksDir: join(stateDir, "tasks"),
+    publicationsDir: join(stateDir, "publications"),
     workspacesDir: join(stateDir, "workspaces"),
     attemptsDir: join(stateDir, "attempts"),
     policyPath: resolve(env.COVEN_GITHUB_POLICY_PATH || join(rootDir, "coven-github-policy.json")),
@@ -84,7 +86,7 @@ export function createConfig(env: NodeJS.ProcessEnv = process.env, rootDir = pro
     demoMode: ["1", "true", "yes"].includes((env.COVEN_GITHUB_DEMO_MODE || "").trim().toLowerCase()),
   };
 
-  for (const directory of [config.deliveriesDir, config.tasksDir, config.workspacesDir, config.attemptsDir]) {
+  for (const directory of [config.deliveriesDir, config.tasksDir, config.publicationsDir, config.workspacesDir, config.attemptsDir]) {
     mkdirSync(directory, {recursive: true});
   }
   return config;
@@ -885,7 +887,7 @@ async function runTask(config: AdapterConfig, taskId: string): Promise<JsonObjec
     task.result_path = finalCycle.result_path;
     task.state = [0, 1, 3].includes(finalCycle.run.returncode) ? "completed" : "failed";
     task.updated_at = utcNow();
-    await publishResultIfConfigured(task, String(finalCycle.result_path), token);
+    await publishResultIfConfigured(config, task, String(finalCycle.result_path), token);
     writeJsonAtomic(path, task);
     return task;
   } catch (error) {
@@ -1054,16 +1056,145 @@ function reviewEvidence(reviewContext: JsonObject, reviewContextPath: string, ta
     workspace_head_sha: checkout.workspace_head_sha,
     changed_file_count: files.length,
     changed_files: files.map((file) => file.filename).filter((file): file is JsonValue => file !== undefined),
+    changed_file_lines: files.map((file) => ({path: file.filename, right_lines: patchRightLines(String(file.patch || ""))})),
     review_context_path: reviewContextPath,
     review_context_sha256: fileSha256(reviewContextPath),
   };
+}
+
+function patchRightLines(patch: string): number[] {
+  const lines: number[] = [];
+  let rightLine: number | null = null;
+  for (const line of patch.split("\n")) {
+    const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      rightLine = Number(hunk[1]);
+      continue;
+    }
+    if (rightLine === null || line.startsWith("\\")) continue;
+    if (line.startsWith("+")) {
+      lines.push(rightLine);
+      rightLine += 1;
+    } else if (!line.startsWith("-")) {
+      rightLine += 1;
+    }
+  }
+  return lines;
 }
 
 function fileSha256(path: string): string {
   return sha256(readFileSync(path));
 }
 
-async function publishResultIfConfigured(task: JsonObject, resultPath: string, token: string): Promise<void> {
+interface NormalizedReviewPublication {
+  review: JsonObject;
+  decision: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+  inlineComments: JsonObject[];
+  validationIssues: string[];
+  evidenceComplete: boolean;
+}
+
+function publicationRecordPath(config: AdapterConfig, repo: string, prNumber: number): string {
+  return join(config.publicationsDir, `${sha256(`${repo}#${prNumber}`).slice(0, 24)}.json`);
+}
+
+function publicationIdentity(task: JsonObject, result: JsonObject): string {
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  return sha256(stableCompactStringify({
+    task_id: task.task_id,
+    head_sha: evidence.head_sha,
+    result,
+  }));
+}
+
+function repositoryPath(value: JsonValue | undefined): string | null {
+  const path = String(value || "").trim();
+  if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").some((part) => !part || part === "." || part === "..")) {
+    return null;
+  }
+  return path;
+}
+
+function actionableFinding(finding: JsonObject): boolean {
+  return !["info", "informational", "nit", "note"].includes(String(finding.severity || "").toLowerCase()) && Boolean(finding.title || finding.body || finding.recommendation);
+}
+
+export function normalizeReviewPublication(task: JsonObject, result: JsonObject): NormalizedReviewPublication {
+  const review = {...((result.review as JsonObject | undefined) || {})};
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const changedFiles = new Set((Array.isArray(evidence.changed_files) ? evidence.changed_files : [])
+    .map((path) => repositoryPath(path))
+    .filter((path): path is string => path !== null));
+  const changedLines = new Map<string, Set<number>>();
+  for (const item of (Array.isArray(evidence.changed_file_lines) ? evidence.changed_file_lines : [])) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const file = repositoryPath((item as JsonObject).path);
+    const lines = (item as JsonObject).right_lines;
+    if (file && Array.isArray(lines)) changedLines.set(file, new Set(lines.map(Number).filter((line) => Number.isInteger(line) && line > 0)));
+  }
+  const validationIssues: string[] = [];
+  const reviewedFiles = (Array.isArray(review.reviewed_files) ? review.reviewed_files : [])
+    .map((path) => repositoryPath(path));
+  const suppliedInspected = (Array.isArray(result.files_inspected) ? result.files_inspected : [])
+    .map((path) => repositoryPath(path));
+  const validReviewedFiles = reviewedFiles.filter((path): path is string => path !== null && changedFiles.has(path));
+  const invalidReviewedFiles = reviewedFiles.filter((path) => path === null || !changedFiles.has(path));
+  if (review.mode !== "pull_request") validationIssues.push("result did not declare pull_request review mode");
+  if (review.evidence_status !== "complete") validationIssues.push("review evidence was not marked complete");
+  if (!String(evidence.head_sha || "").trim()) validationIssues.push("PR head revision is missing");
+  if (!changedFiles.size) validationIssues.push("no changed-file evidence was captured");
+  if (!reviewedFiles.length) validationIssues.push("no reviewed files were reported");
+  if (invalidReviewedFiles.length) validationIssues.push("reviewed files are not all changed files in the captured PR revision");
+  if (suppliedInspected.some((path) => path === null || !changedFiles.has(path))) validationIssues.push("files_inspected contains paths outside the captured PR diff");
+  if (suppliedInspected.length && suppliedInspected.filter((path): path is string => path !== null).some((path) => !validReviewedFiles.includes(path))) {
+    validationIssues.push("files_inspected and reviewed_files disagree");
+  }
+
+  const testsRun = Array.isArray(review.tests_run) ? (review.tests_run as JsonObject[]) : [];
+  for (const test of testsRun) {
+    const command = String(test.command || "").trim();
+    const status = String(test.status || "").toLowerCase();
+    const output = String(test.output_summary || "").trim();
+    const narrative = `${String(result.summary || "")}\n${String(result.pr_body || "")}`.toLowerCase();
+    if (status === "passed" && (!command || !output || output.toLowerCase().includes("not run") || narrative.includes(`${command.toLowerCase()} - not run`))) {
+      validationIssues.push(`test evidence for ${command || "an unnamed command"} is contradictory or incomplete`);
+    }
+  }
+
+  const findings = Array.isArray(review.findings) ? (review.findings as JsonObject[]) : [];
+  const inlineComments: JsonObject[] = [];
+  for (const finding of findings) {
+    const path = repositoryPath(finding.file);
+    const line = Number(finding.line);
+    if (path && changedFiles.has(path) && changedLines.get(path)?.has(line) && Number.isInteger(line) && line > 0 && actionableFinding(finding)) {
+      inlineComments.push({
+        path,
+        line,
+        side: String(finding.side || "RIGHT").toUpperCase() === "LEFT" ? "LEFT" : "RIGHT",
+        body: findingCommentBody(finding),
+      });
+    }
+  }
+
+  const evidenceComplete = validationIssues.length === 0;
+  const actionable = findings.some(actionableFinding);
+  return {
+    review,
+    decision: evidenceComplete && !findings.length ? "APPROVE" : evidenceComplete && actionable ? "REQUEST_CHANGES" : "COMMENT",
+    inlineComments,
+    validationIssues,
+    evidenceComplete,
+  };
+}
+
+function findingCommentBody(finding: JsonObject): string {
+  const parts = [`**${String(finding.severity || "finding")}**: ${String(finding.title || "Untitled finding")}`];
+  if (finding.body) parts.push("", String(finding.body));
+  if (finding.recommendation) parts.push("", `Suggested resolution: ${String(finding.recommendation)}`);
+  return parts.join("\n").slice(0, 6000);
+}
+
+export async function publishResultIfConfigured(config: AdapterConfig, task: JsonObject, resultPath: string, token: string): Promise<void> {
   const publication = (task.publication as JsonObject | undefined) || {};
   const mode = publication.mode || "record_only";
   if (mode !== "comment") {
@@ -1073,17 +1204,52 @@ async function publishResultIfConfigured(task: JsonObject, resultPath: string, t
 
   const result = readJson<JsonObject>(resultPath, {});
   const taskData = (task.task as JsonObject | undefined) || {};
-  const number = taskData.issue_number || taskData.pr_number;
+  const prNumber = prNumberForTask(task);
+  const number = taskData.issue_number || taskData.pr_number || prNumber;
   if (!number) {
     task.publication_state = "publication_skipped_no_issue_or_pr_number";
     return;
   }
 
-  const body = publicationCommentBody(task, result);
   const repo = String(task.repository);
+  const identity = publicationIdentity(task, result);
   try {
-    const response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/issues/${Number(number)}/comments`, token, {body})) as JsonObject;
-    task.publication_state = "published_comment";
+    if (prNumber && Object.keys((result.review as JsonObject | undefined) || {}).length) {
+      if (task.publication_identity === identity && task.publication_review_id) {
+        task.publication_state = "publication_skipped_duplicate";
+        return;
+      }
+      const recordPath = publicationRecordPath(config, repo, prNumber);
+      const previous = readJson<JsonObject>(recordPath, {});
+      const normalized = normalizeReviewPublication(task, result);
+      const body = publicationReviewBody(task, result, normalized, previous);
+      const reviewPayload: JsonObject = {event: normalized.decision, body};
+      if (normalized.inlineComments.length) reviewPayload.comments = normalized.inlineComments;
+      let response: JsonObject;
+      try {
+        response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token, reviewPayload)) as JsonObject;
+      } catch (error) {
+        if (!normalized.inlineComments.length) throw error;
+        response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token, {event: normalized.decision, body: `${body}\n\n_Inline publication was unavailable; findings are included above._`})) as JsonObject;
+        normalized.validationIssues.push("inline finding locations were rejected by GitHub; findings were retained in the review body");
+      }
+      task.publication_state = "published_review";
+      task.publication_identity = identity;
+      task.publication_review_id = response.id;
+      task.publication_url = response.html_url;
+      task.publication_decision = normalized.decision;
+      writeJsonAtomic(recordPath, {identity, review_id: response.id, review_url: response.html_url, task_id: task.task_id, head_sha: ((task.review_evidence as JsonObject | undefined) || {}).head_sha, published_at: utcNow()});
+      return;
+    }
+
+    const body = publicationCommentBody(task, result, "Coven task result");
+    const method = task.publication_comment_id ? "PATCH" : "POST";
+    const url = task.publication_comment_id
+      ? `https://api.github.com/repos/${repo}/issues/comments/${Number(task.publication_comment_id)}`
+      : `https://api.github.com/repos/${repo}/issues/${Number(number)}/comments`;
+    const response = (await githubRequest(method, url, token, {body})) as JsonObject;
+    task.publication_state = method === "PATCH" ? "updated_comment" : "published_comment";
+    task.publication_identity = identity;
     task.publication_url = response.html_url;
     task.publication_comment_id = response.id;
   } catch (error) {
@@ -1092,7 +1258,16 @@ async function publishResultIfConfigured(task: JsonObject, resultPath: string, t
   }
 }
 
-function publicationCommentBody(task: JsonObject, result: JsonObject): string {
+function publicationReviewBody(task: JsonObject, result: JsonObject, normalized: NormalizedReviewPublication, previous: JsonObject): string {
+  const body = publicationCommentBody(task, result, "Coven review");
+  const additions: string[] = [];
+  if (previous.review_url && previous.identity !== task.publication_identity) additions.push(`This review supersedes [the prior covencat publication](${String(previous.review_url)}).`);
+  if (normalized.validationIssues.length) additions.push(`### Publication validation\n- ${normalized.validationIssues.join("\n- ")}\n\nEvidence was incomplete or contradictory, so this is a COMMENT review rather than an approval or change request.`);
+  if (normalized.review.findings && Array.isArray(normalized.review.findings) && normalized.inlineComments.length < normalized.review.findings.length) additions.push("### Findings without valid inline locations\nThe structured findings above remain part of this review body because their file/line locations could not be safely attached to the current diff.");
+  return [body, ...additions].join("\n\n");
+}
+
+function publicationCommentBody(task: JsonObject, result: JsonObject, heading = "Coven task result"): string {
   const status = result.status || "unknown";
   const summary = String(result.summary || "No summary returned.");
   const prBody = String(result.pr_body || "");
@@ -1101,7 +1276,7 @@ function publicationCommentBody(task: JsonObject, result: JsonObject): string {
   const taskId = String(task.task_id || "");
   const evidence = (task.review_evidence as JsonObject | undefined) || {};
   const review = (result.review as JsonObject | undefined) || {};
-  const parts = ["## Cody dogfood result", "", `**Status:** ${status}`, "", summary.trim()];
+  const parts = [`## ${heading}`, "", `**Status:** ${status}`, "", summary.trim()];
   if (prBody.trim() && prBody.trim() !== summary.trim()) {
     parts.push("", prBody.trim());
   }
@@ -1122,13 +1297,13 @@ function publicationCommentBody(task: JsonObject, result: JsonObject): string {
   } else {
     parts.push("- No PR review evidence was captured for this run.");
   }
-  parts.push(...structuredReviewLines(review));
+  parts.push(...structuredReviewLines(review, task));
   parts.push(
     "",
     `**Files changed:** ${filesChanged.length}`,
     `**Commits:** ${commits.length}`,
     "",
-    `_Task \`${taskId}\`. Publication is enabled on the hosted test adapter only._`,
+    `_Task \`${taskId}\`._`,
   );
   return parts.join("\n");
 }
@@ -1148,7 +1323,19 @@ function reviewFixLoopLines(task: JsonObject): string[] {
   return lines;
 }
 
-function structuredReviewLines(review: JsonObject): string[] {
+function githubFileMarkdown(task: JsonObject, raw: JsonValue): string {
+  const match = String(raw).match(/^(.*?)(?::(\d+))?$/);
+  const path = repositoryPath(match?.[1]);
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const ref = String(evidence.head_sha || "").trim();
+  const repo = String(task.repository || "").trim();
+  if (!path || !ref || !repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return `\`${String(raw)}\``;
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  const anchor = match?.[2] ? `#L${match[2]}` : "";
+  return `[\`${String(raw)}\`](https://github.com/${repo}/blob/${encodeURIComponent(ref)}/${encodedPath}${anchor})`;
+}
+
+function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] {
   if (!Object.keys(review).length) {
     return ["", "### Structured review", "- No structured review result was emitted."];
   }
@@ -1162,7 +1349,7 @@ function structuredReviewLines(review: JsonObject): string[] {
   const reviewedFiles = Array.isArray(review.reviewed_files) ? review.reviewed_files : [];
   lines.push(`- Reviewed files: ${reviewedFiles.length}`);
   if (reviewedFiles.length) {
-    lines.push(`- Reviewed file list: ${reviewedFiles.slice(0, 20).map((path) => `\`${path}\``).join(", ")}`);
+    lines.push(`- Reviewed file list: ${reviewedFiles.slice(0, 20).map((path) => task ? githubFileMarkdown(task, path) : `\`${path}\``).join(", ")}`);
     if (reviewedFiles.length > 20) {
       lines.push("- Reviewed file list truncated after 20 entries.");
     }
@@ -1170,7 +1357,7 @@ function structuredReviewLines(review: JsonObject): string[] {
   const supportingFiles = Array.isArray(review.supporting_files) ? review.supporting_files : [];
   lines.push(`- Supporting files inspected: ${supportingFiles.length}`);
   if (supportingFiles.length) {
-    lines.push(`- Supporting file list: ${supportingFiles.slice(0, 20).map((path) => `\`${path}\``).join(", ")}`);
+    lines.push(`- Supporting file list: ${supportingFiles.slice(0, 20).map((path) => task ? githubFileMarkdown(task, path) : `\`${path}\``).join(", ")}`);
     if (supportingFiles.length > 20) {
       lines.push("- Supporting file list truncated after 20 entries.");
     }
