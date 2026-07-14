@@ -51,7 +51,7 @@ export interface AdapterResponse {
   body: JsonObject;
 }
 
-interface CommandResult extends JsonObject {
+export interface CommandResult extends JsonObject {
   args: string[];
   returncode: number;
   stdout: string;
@@ -179,7 +179,7 @@ function createFreshChildDirectory(parent: string, name: string, label: string):
   return path;
 }
 
-function createFreshTaskAttemptDirectory(root: string, taskId: string, attempt: number, label: string): string {
+export function createFreshTaskAttemptDirectory(root: string, taskId: string, attempt: number, label: string): string {
   if (!validRecordId(taskId)) throw new Error(`Invalid task ID for ${label}`);
   if (!Number.isSafeInteger(attempt) || attempt <= 0) throw new Error(`Invalid attempt number for ${label}`);
   const taskRoot = ensureManagedChildDirectory(root, taskId, `${label} task directory`);
@@ -1613,6 +1613,7 @@ async function runTaskUnlocked(config: AdapterConfig, taskId: string): Promise<J
     task.session_brief_path = firstCycle.brief_path;
     task.session_brief_sha256 = fileSha256(String(firstCycle.brief_path));
     task.runtime_exit_code = firstCycle.run.returncode;
+    task.runtime_diagnostic = runtimeDiagnostic(firstCycle.run) || undefined;
     task.result_path = firstCycle.result_path;
     writeJsonAtomic(path, task);
 
@@ -1641,6 +1642,7 @@ async function runTaskUnlocked(config: AdapterConfig, taskId: string): Promise<J
       });
       task.review_fix_loops = loopRecords;
       task.runtime_exit_code = repairCycle.run.returncode;
+      task.runtime_diagnostic = runtimeDiagnostic(repairCycle.run) || undefined;
       task.result_path = repairCycle.result_path;
       task.updated_at = utcNow();
       writeJsonAtomic(path, task);
@@ -3588,6 +3590,10 @@ function publicationCommentBody(task: JsonObject, result: JsonObject, heading = 
   if (prBody.trim() && prBody.trim() !== summary.trim()) {
     parts.push("", prBody.trim());
   }
+  const diagnostic = safePublicationText(String(task.runtime_diagnostic || ""), 1000).trim();
+  if (diagnostic && result.status !== "success") {
+    parts.push("", "### Runtime diagnostic", diagnostic);
+  }
   parts.push(...reviewFixLoopLines(task), "", "### Evidence");
   if (Object.keys(evidence).length) {
     const changedFiles = Array.isArray(evidence.changed_files) ? evidence.changed_files : [];
@@ -3741,11 +3747,35 @@ function codexTokenCandidates(config: AdapterConfig): string[] {
 }
 
 function redactedCommandResult(result: CommandResult): JsonObject {
+  const diagnostic = runtimeDiagnostic(result);
   return {
     ...result,
     stdout: redactTokenish(result.stdout),
     stderr: redactTokenish(result.stderr),
+    ...(diagnostic ? {runtime_diagnostic: diagnostic} : {}),
   };
+}
+
+export function runtimeDiagnostic(result: CommandResult): string | null {
+  if (result.returncode === 0 && !result.signal && !result.timed_out && !result.spawn_error) {
+    return null;
+  }
+  if (result.timed_out) {
+    return "Coven Code timed out before completing the hosted review.";
+  }
+  if (result.signal) {
+    return `Coven Code stopped after signal ${safePublicationText(String(result.signal), 40)}.`;
+  }
+  const raw = String(result.stderr || result.spawn_error || "").trim();
+  if (!raw) {
+    return `Coven Code exited ${result.returncode} without a diagnostic.`;
+  }
+  const safe = redactTokenish(raw)
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted email]")
+    .replace(/\bon account\s+[^\n.]+/gi, "on the configured account")
+    .replace(/\s+/g, " ")
+    .trim();
+  return safePublicationText(safe, 1000);
 }
 
 export function sanitizedRuntimeEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -3782,6 +3812,8 @@ export function redactTokenish(text: string): string {
     .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_-]{6,}/g, "[redacted github token]")
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}/g, "[redacted OpenAI token]")
     .replace(/\bBearer\s+[^\s'\"]+/gi, "Bearer [redacted]")
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted email]")
+    .replace(/\bon account\s+`?[^`\n.]+`?/gi, "on the configured account")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted JWT]")
     .replace(/x-access-token:[^@\s'\"]+/gi, "x-access-token:[redacted]")
     .replace(/(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi, "$1[redacted]@");
