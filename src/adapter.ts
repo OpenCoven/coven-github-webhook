@@ -1865,7 +1865,7 @@ async function runTaskUnlocked(config: AdapterConfig, taskId: string): Promise<J
     task.state = [0, 1, 3].includes(firstCycle.run.returncode) ? "completed" : "failed";
     task.updated_at = utcNow();
     const validationReceipts = runPublicationValidationChecks(config, task, workspace, attemptDir);
-    task.result_path = finalizeReviewResult(String(task.result_path), attemptDir, validationReceipts);
+    task.result_path = finalizeReviewResult(String(task.result_path), attemptDir, validationReceipts, task);
     refreshPublicationWorkspaceEvidence(config, task, workspace, attemptDir);
     task.publication_state = "publication_pending";
     writeJsonAtomic(path, task);
@@ -2686,10 +2686,54 @@ function executionOnlyLimitation(value: string): boolean {
     || /\b(?:tests?|checks?|commands?|suite)\b.{0,80}\b(?:not run|not executed|were not run|could not run|unable to run)\b/i.test(value);
 }
 
-function finalizeReviewResult(resultPath: string, attemptDir: string, receipts: JsonObject[]): string {
+export function trustedValidationFindings(task: JsonObject, receipts: JsonObject[]): JsonObject[] {
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const changedFiles = (Array.isArray(evidence.changed_files) ? evidence.changed_files : [])
+    .map((path) => repositoryPath(path))
+    .filter((path): path is string => path !== null);
+  const changedLines = new Map<string, number[]>();
+  for (const item of (Array.isArray(evidence.changed_file_lines) ? evidence.changed_file_lines : [])) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const path = repositoryPath((item as JsonObject).path);
+    if (!path) continue;
+    const lines = [
+      ...(Array.isArray((item as JsonObject).right_lines) ? (item as JsonObject).right_lines as JsonValue[] : []),
+      ...(Array.isArray((item as JsonObject).left_lines) ? (item as JsonObject).left_lines as JsonValue[] : []),
+    ].map(Number).filter((line) => Number.isInteger(line) && line > 0);
+    changedLines.set(path, [...new Set(lines)].sort((left, right) => left - right));
+  }
+  const findings: JsonObject[] = [];
+  for (const receipt of receipts) {
+    if (receipt.status !== "failed" || Number(receipt.returncode) === 0 || receipt.timed_out === true) continue;
+    const output = String(receipt.output_summary || "");
+    for (const path of changedFiles) {
+      const match = new RegExp(`(?:^|[\\s'\"])(?:/workspace/)?${escapeRegExp(path)}(?::(\\d+))?(?::\\d+)?(?:$|[\\s:])`, "m").exec(output);
+      if (!match) continue;
+      const reportedLine = Number(match[1] || 0);
+      const candidates = changedLines.get(path) || [];
+      const line = candidates.length
+        ? candidates.reduce((best, candidate) => !reportedLine || Math.abs(candidate - reportedLine) < Math.abs(best - reportedLine) ? candidate : best, candidates[0])
+        : null;
+      findings.push({
+        severity: "high",
+        file: path,
+        line,
+        title: "Trusted validation fails for this changed file",
+        body: `The trusted host command \`${safePublicationText(String(receipt.command || "validation command"), 300)}\` failed and referenced \`${path}${reportedLine ? `:${reportedLine}` : ""}\`.`,
+        recommendation: "Correct the referenced defect in this changed file and rerun the configured trusted validation command.",
+      });
+      if (findings.length >= 10) return findings;
+    }
+  }
+  return findings;
+}
+
+function finalizeReviewResult(resultPath: string, attemptDir: string, receipts: JsonObject[], task: JsonObject): string {
   const result = readBoundedRuntimeResult(resultPath);
   const review = {...((result.review as JsonObject | undefined) || {})};
-  const findings = Array.isArray(review.findings) ? review.findings : [];
+  let findings = Array.isArray(review.findings) ? review.findings : [];
+  if (!findings.length) findings = trustedValidationFindings(task, receipts);
+  review.findings = findings;
   review.tests_run = receipts.map((receipt) => ({
     command: receipt.command,
     status: receipt.status,

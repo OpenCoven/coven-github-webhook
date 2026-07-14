@@ -38,6 +38,7 @@ import {
   runTask,
   sanitizedRuntimeEnvironment,
   sessionBrief,
+  trustedValidationFindings,
   withEphemeralCodexCredential,
   type JsonObject,
   type JsonValue,
@@ -1734,6 +1735,27 @@ test("failed trusted validation permits REQUEST_CHANGES only with an actionable 
   const noFinding = normalizeReviewPublication(task, completeReview(), "abc123");
   assert.equal(noFinding.evidenceComplete, false);
   assert.equal(noFinding.decision, "COMMENT");
+});
+
+test("trusted validation derives findings only from failures mapped to verified changed paths", () => {
+  const task = reviewTask("trusted-finding-derivation");
+  const mapped = trustedValidationFindings(task, [trustedValidationReceipt({
+    returncode: 1,
+    status: "failed",
+    output_summary: "/workspace/src/app.ts:99 SyntaxError: Unexpected end of input",
+  })]);
+  assert.equal(mapped.length, 1);
+  assert.equal(mapped[0].file, "src/app.ts");
+  assert.equal(mapped[0].line, 12);
+  assert.match(String(mapped[0].body), /trusted host command/);
+
+  const unrelated = trustedValidationFindings(task, [trustedValidationReceipt({
+    returncode: 1,
+    status: "failed",
+    output_summary: "/workspace/src/unrelated.ts:4 failed",
+  })]);
+  assert.deepEqual(unrelated, []);
+  assert.deepEqual(trustedValidationFindings(task, [trustedValidationReceipt()]), []);
 });
 
 test("replaces runtime-authored test claims with trusted host receipts", async () => {
