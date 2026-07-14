@@ -37,6 +37,7 @@ import {
   runnableTaskIds,
   runTask,
   sanitizedRuntimeEnvironment,
+  sessionBrief,
   withEphemeralCodexCredential,
   type JsonObject,
   type JsonValue,
@@ -1093,6 +1094,23 @@ test("Codex OAuth reaches the sandbox only through a private ephemeral token fil
   assert.equal(existsSync(credentialPath), false);
 });
 
+test("hosted review brief directs failed trusted validation into source-backed findings", () => {
+  const brief = sessionBrief(
+    {repository: "OpenCoven/example", trigger: "pull_request_autoreview", task: {}, familiar: {}},
+    "/workspace",
+    {
+      changed_files: ["probe/covencat-live.mjs"],
+      trusted_validation: {
+        source: "coven-github-host",
+        receipts: [trustedValidationReceipt({status: "failed", returncode: 1, output_summary: "SyntaxError: Unexpected end of input"})],
+      },
+    },
+  );
+  assert.match(String(brief.audit_instruction), /executed outside the model/);
+  assert.match(String(brief.audit_instruction), /report each verified actionable defect as a finding/);
+  assert.doesNotMatch(String(brief.audit_instruction), /trust.*runtime/i);
+});
+
 test("runtime result reader rejects symlinks and oversized artifacts", () => {
   const root = mkdtempSync(join(tmpdir(), "coven-runtime-result-"));
   const valid = join(root, "valid.json");
@@ -1691,6 +1709,31 @@ test("downgrades incomplete, contradictory, or malformed review evidence", () =>
     assert.equal(normalized.decision, "COMMENT", name);
     assert.equal(normalized.evidenceComplete, false, name);
   }
+});
+
+test("failed trusted validation permits REQUEST_CHANGES only with an actionable source-backed finding", () => {
+  const task = reviewTask("failed-validation-actionable-finding");
+  (task.review_evidence as JsonObject).host_validation_checks = [trustedValidationReceipt({
+    returncode: 1,
+    status: "failed",
+    output_summary: "src/app.ts:12 validation failed",
+  })];
+  const result = completeReview([{
+    severity: "high",
+    file: "src/app.ts",
+    line: 12,
+    title: "Reject invalid input",
+    body: "The trusted validation failure confirms this changed line accepts malformed input.",
+    recommendation: "Validate the input before accepting the request.",
+  }]);
+  const normalized = normalizeReviewPublication(task, result, "abc123");
+  assert.equal(normalized.evidenceComplete, true);
+  assert.equal(normalized.decision, "REQUEST_CHANGES");
+  assert.equal(((normalized.review.tests_run as JsonObject[])[0]).status, "failed");
+
+  const noFinding = normalizeReviewPublication(task, completeReview(), "abc123");
+  assert.equal(noFinding.evidenceComplete, false);
+  assert.equal(noFinding.decision, "COMMENT");
 });
 
 test("replaces runtime-authored test claims with trusted host receipts", async () => {

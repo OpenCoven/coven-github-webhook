@@ -1517,7 +1517,7 @@ export function probeRuntimeIsolation(config: AdapterConfig, attemptDir: string)
   }
 }
 
-function sessionBrief(
+export function sessionBrief(
   task: JsonObject,
   workspace: string,
   reviewContext?: JsonObject | null,
@@ -1540,6 +1540,11 @@ function sessionBrief(
   if (reviewContext) {
     brief.review_context = reviewContext;
     let instruction = "This run is evidence-backed. Review the supplied PR metadata and changed-file patches in review_context before responding. Cite the specific changed files you inspected in the result summary.";
+    const trustedValidation = (reviewContext.trusted_validation as JsonObject | undefined) || {};
+    const trustedReceipts = Array.isArray(trustedValidation.receipts) ? trustedValidation.receipts as JsonObject[] : [];
+    if (trustedReceipts.length) {
+      instruction += " Trusted validation was executed outside the model and is included in review_context.trusted_validation. Treat only those receipts as executed-test evidence. When a trusted check fails, inspect the referenced changed source and report each verified actionable defect as a finding; do not convert a failed check into a no-findings result or a mere execution limitation.";
+    }
     if (extraAuditInstruction) {
       instruction = `${instruction}\n\n${extraAuditInstruction}`;
     }
@@ -1828,11 +1833,18 @@ async function runTaskUnlocked(config: AdapterConfig, taskId: string): Promise<J
       : "";
     const reviewContext = await prepareReviewContext(config, task, workspace, reviewContextToken, gitEnv, attemptDir);
     if (reviewContext) {
+      const preReviewReceipts = runTrustedValidationChecks(config, task, workspace, attemptDir, "pre-review-check");
+      reviewContext.trusted_validation = {
+        source: "coven-github-host",
+        phase: "pre_review",
+        receipts: preReviewReceipts,
+      };
       const reviewContextPath = join(attemptDir, "review-context.json");
       writeJsonAtomic(reviewContextPath, reviewContext);
       task.review_context_path = reviewContextPath;
       task.review_context_sha256 = fileSha256(reviewContextPath);
       task.review_evidence = reviewEvidence(reviewContext, reviewContextPath, task);
+      (task.review_evidence as JsonObject).pre_review_validation_checks = preReviewReceipts;
       writeJsonAtomic(path, task);
     }
 
@@ -3817,6 +3829,7 @@ export function normalizeReviewPublication(
     }
   }
   const validationIssues: string[] = [];
+  const failedHostValidationIssues: string[] = [];
   if (String(result.contract_version || "") !== "2") validationIssues.push("result contract_version is not v2");
   if (!["success", "failure", "partial", "needs_input"].includes(String(result.status || ""))) validationIssues.push("result status is invalid");
   if (typeof result.summary !== "string" || typeof result.pr_body !== "string") validationIssues.push("result summary or pr_body is invalid");
@@ -3910,7 +3923,7 @@ export function normalizeReviewPublication(
       workspace_revision: check.workspace_revision,
     });
     if (!passed) {
-      validationIssues.push(`host validation check ${command} exited ${returncode}`);
+      failedHostValidationIssues.push(`host validation check ${command} exited ${returncode}`);
     }
   }
 
@@ -3943,9 +3956,10 @@ export function normalizeReviewPublication(
     }
   }
 
-  if (!findings.length && !String(review.no_findings_reason || "").trim()) validationIssues.push("no-findings review is missing its justification");
-  const evidenceComplete = validationIssues.length === 0;
   const actionable = scopedFindings.some(actionableFinding);
+  if (!findings.length && !String(review.no_findings_reason || "").trim()) validationIssues.push("no-findings review is missing its justification");
+  if (!actionable) validationIssues.push(...failedHostValidationIssues);
+  const evidenceComplete = validationIssues.length === 0;
   review.evidence_status = evidenceComplete ? "complete" : "partial";
   review.reviewed_files = validReviewedFiles;
   review.supporting_files = validSupportingFiles;
