@@ -71,8 +71,10 @@ export function createWorkerTaskScheduler(config: AdapterConfig, options: TaskWo
             let retryableAttempt = 0;
             let retryNotBefore = "";
             let retryCategory = "";
+            let followupTaskId = "";
             worker.on("message", (message) => {
               const result = (message && typeof message === "object" ? message : {}) as Record<string, unknown>;
+              if (result.followup_task_id) followupTaskId = String(result.followup_task_id);
               if (result.publication_state === "revision_reconciliation_retry_pending" || result.publication_state === "publication_failed") {
                 retryableAttempt = Number(result.publication_attempts || result.attempts || 1);
                 retryNotBefore = String(result.retry_not_before || "");
@@ -98,6 +100,7 @@ export function createWorkerTaskScheduler(config: AdapterConfig, options: TaskWo
                 }
               } else {
                 crashRetries.delete(taskId);
+                if (followupTaskId) enqueue(followupTaskId);
                 if (retryableAttempt > 0 && !retryTimers.has(taskId)) {
                   const persistedDelay = Date.parse(retryNotBefore) - Date.now();
                   const delay = Number.isFinite(persistedDelay) && persistedDelay > 0

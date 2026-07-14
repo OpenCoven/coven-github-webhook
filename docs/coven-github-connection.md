@@ -118,6 +118,20 @@ blocked until the mandatory runtime sandbox below passes its executable probe.
 For decisive native reviews, also configure a bounded list of trusted
 validation commands under `publication.validation_commands`; a runtime-authored
 claim without a matching successful sandbox receipt is published as COMMENT.
+The adapter replaces model-authored `tests_run` claims with signed host receipts;
+file reads, searches, PR text, and model narratives are never execution proof.
+
+Autoreview and branch repair are independent repository opt-ins. Configure
+`autoreview.enabled` for exact-SHA reviews and optionally `include_drafts`.
+Configure `repair.enabled` only for trusted same-repository branches, with
+`max_attempts` from 1 through 3, bounded `allowed_paths`, `protected_paths`,
+`protected_branches`, `max_changed_files`, and `max_diff_bytes`. Repair sessions
+receive file tools only; the host performs validation, commit, and non-force push
+with a fresh repository-scoped installation token. Set `kill_switch` at the
+repository route to stop both new tasks and any in-progress repair before push.
+The GitHub App installation must grant repository Contents read/write for repair;
+the adapter requests that authority only in the fresh repair token and does not
+reuse the publication or runtime token.
 
 ## Runtime Checklist
 

@@ -64,8 +64,9 @@ The deployment expects secrets and mutable state to be supplied outside git:
 - `COVEN_CODE_BIN` - absolute coven-code path inside that rootfs
 - `COVEN_RUNTIME_NETWORK=shared` - explicit opt-in required when the Codex
   provider needs network access; the default is `none`
-- `COVEN_REVIEW_FIX_LOOPS` - optional bounded review-fix loop count, clamped
-  between `0` and `5`; defaults to `0` so hosted repair loops are opt-in
+- Automatic review and repair are repository-policy controls, not ambient
+  environment switches. `autoreview.enabled` and `repair.enabled` must each be
+  opted into explicitly; `kill_switch` stops new routing and repair pushes.
 - Codex OAuth tokens under the deployed account's `.coven-code` directory
 
 Do not commit private keys, webhook secrets, OAuth tokens, generated task state,
@@ -185,7 +186,9 @@ connection guide in
   sandbox.
 - Uses repository-scoped installation tokens: parent Git gets only
   `contents:read`, PR evidence gets read authority, and publication write
-  authority is minted only after isolated execution has finished.
+  authority is minted only after isolated execution has finished. An opted-in
+  repair mints a separate short-lived token with only `contents:write` and
+  `pull_requests:read`; the model never receives it.
 - Persists `publication_pending` before GitHub writes and resumes interrupted
   publication on startup or duplicate webhook delivery without rerunning the
   agent.
@@ -198,6 +201,12 @@ connection guide in
 - Publishes non-PR task results and operational notices as issue comments,
   including structured `reviewed_files`, `supporting_files`, findings, test
   evidence, no-findings rationale, and limitations.
-- When `COVEN_REVIEW_FIX_LOOPS` is greater than `0`, reruns `coven-code` with
-  prior structured review findings as explicit repair instructions until no
-  findings remain or the configured loop count is exhausted.
+- With explicit `autoreview.enabled`, routes opened, ready-for-review, reopened,
+  and synchronized pull-request revisions by repository, PR number, and exact
+  head SHA. Drafts remain excluded unless `include_drafts` is enabled.
+- With separate `repair.enabled`, an evidence-complete REQUEST_CHANGES review
+  may launch a file-write-only hosted repair. The trusted host rejects forks,
+  protected branches and paths, oversized or unrelated diffs, stale heads, and
+  failed validation; it then creates a Covencat-attributed non-force commit and
+  queues a fresh review of the new SHA. The loop stops after the configured
+  `max_attempts` (clamped to 1-3) or on repeated findings or non-progress.

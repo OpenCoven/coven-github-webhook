@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -12,11 +13,15 @@ import {
   buildTaskFromEvent,
   createFreshTaskAttemptDirectory,
   createConfig,
+  createFollowupReviewTask,
   githubRequestAllPages,
   handleRequest,
+  inspectRepairDiff,
   normalizeReviewPublication,
   patchEvidenceIncomplete,
   publicationInstallationTokenRequest,
+  repairEligibilityIssue,
+  repairInstallationTokenRequest,
   publishResultIfConfigured,
   readBoundedRuntimeResult,
   recoverPendingPublications,
@@ -65,7 +70,7 @@ function reviewTask(taskId = "review-task"): JsonObject {
   return {
     task_id: taskId,
     repository: "OpenCoven/example",
-    publication: {mode: "comment"},
+    publication: {mode: "comment", validation_commands: ["npm test"]},
     runtime_isolation: {mode: "bwrap", verified: true},
     policy_snapshot: {
       bot_usernames: ["covencat[bot]"],
@@ -83,16 +88,35 @@ function reviewTask(taskId = "review-task"): JsonObject {
       changed_file_count: 2,
       expected_changed_file_count: 2,
       incomplete_patch_files: [],
-      host_validation_checks: [{
-        command: "npm test",
-        returncode: 0,
-        stdout_sha256: "a".repeat(64),
-        stderr_sha256: "b".repeat(64),
-      }],
+      host_validation_checks: [trustedValidationReceipt()],
       changed_files: ["src/app.ts", "tests/app.test.ts"],
       changed_file_lines: [{path: "src/app.ts", left_lines: [9], right_lines: [12]}],
     },
   };
+}
+
+function trustedValidationReceipt(overrides: JsonObject = {}): JsonObject {
+  const receipt: JsonObject = {
+    command: "npm test",
+    returncode: 0,
+    status: "passed",
+    output_summary: "all tests passed",
+    stdout_sha256: "a".repeat(64),
+    stderr_sha256: "b".repeat(64),
+    workspace_revision: "abc123",
+    workspace_diff_sha256: createHash("sha256").update("").digest("hex"),
+    timeout_seconds: 300,
+    timed_out: false,
+    duration_ms: 25,
+    output_limit_bytes: 2 * 1024 * 1024,
+    stdout_truncated: false,
+    stderr_truncated: false,
+    artifact: "receipt.json",
+    completed_at: "2026-07-14T12:00:00.000Z",
+    ...overrides,
+  };
+  receipt.receipt_sha256 = createHash("sha256").update(stableCompact(receipt)).digest("hex");
+  return receipt;
 }
 
 function signedPublicationMarker(identity: string, createdAt = "", target = "OpenCoven/example#pr:7"): string {
@@ -631,8 +655,229 @@ test("runtime token is restricted to one repository with contents read authority
     repository_ids: [987654321],
     permissions: {issues: "write", pull_requests: "write"},
   });
+  assert.deepEqual(repairInstallationTokenRequest(987654321), {
+    repository_ids: [987654321],
+    permissions: {contents: "write", pull_requests: "read"},
+  });
   assert.throws(() => runtimeInstallationTokenRequest(undefined), /valid repository ID/);
   assert.throws(() => publicationInstallationTokenRequest("not-a-repository"), /valid repository ID/);
+});
+
+test("autoreview routes supported PR actions by exact repository PR and head identity", () => {
+  const headSha = "a".repeat(40);
+  const payload: JsonObject = {
+    action: "opened",
+    installation: {id: 123456},
+    repository: {id: 987654321, full_name: "OpenCoven/example", default_branch: "main"},
+    pull_request: {
+      number: 17,
+      draft: false,
+      head: {sha: headSha, ref: "feature/autoreview", repo: {id: 987654321, full_name: "OpenCoven/example"}},
+      base: {sha: "b".repeat(40), ref: "main"},
+    },
+  };
+  const policy: JsonObject = {
+    autoreview: {enabled: true},
+    familiar: {id: "covencat", display_name: "Covencat"},
+    publication: {mode: "comment", validation_commands: ["npm test"]},
+  };
+  const opened = buildTaskFromEvent("pull_request", "delivery-opened", payload, policy);
+  const synchronized = buildTaskFromEvent("pull_request", "delivery-sync", {...payload, action: "synchronize"}, policy);
+  assert.equal(opened.trigger, "pull_request_autoreview");
+  assert.equal(opened.task_id, synchronized.task_id);
+  assert.equal(opened.dedupe_key, `987654321#17@${headSha}`);
+  assert.equal((opened.target as JsonObject).head_sha, headSha);
+  assert.equal((opened.task as JsonObject).kind, "respond_to_mention");
+
+  const draft = buildTaskFromEvent("pull_request", "delivery-draft", {
+    ...payload,
+    pull_request: {...(payload.pull_request as JsonObject), draft: true},
+  }, policy);
+  assert.equal(draft.state, "ignored");
+  assert.equal(draft.ignored_reason, "autoreview_draft_disabled");
+  const includedDraft = buildTaskFromEvent("pull_request", "delivery-draft-enabled", {
+    ...payload,
+    pull_request: {...(payload.pull_request as JsonObject), draft: true},
+  }, {...policy, autoreview: {enabled: true, include_drafts: true}});
+  assert.equal(includedDraft.trigger, "pull_request_autoreview");
+});
+
+test("signed autoreview deliveries with the same PR head converge on one queued task", async () => {
+  const stateDir = tempStateDir();
+  const secret = "autoreview-dedupe-secret";
+  const policyPath = join(stateDir, "policy.json");
+  writeFileSync(policyPath, JSON.stringify({
+    version: 1,
+    installations: {
+      "123456": {
+        repositories: {
+          "987654321": {
+            enabled: true,
+            enabled_triggers: [
+              "pull_request.opened",
+              "pull_request.synchronize",
+              "pull_request.edited",
+              "pull_request.reopened",
+              "push",
+            ],
+            familiar: {id: "covencat", display_name: "Covencat", skills: []},
+            publication: {mode: "comment", validation_commands: ["npm test"]},
+            autoreview: {enabled: true},
+          },
+        },
+      },
+    },
+  }));
+  const config = createConfig({
+    COVEN_GITHUB_STATE_DIR: stateDir,
+    COVEN_GITHUB_POLICY_PATH: policyPath,
+    GITHUB_WEBHOOK_SECRET: secret,
+    COVEN_GITHUB_REVOCATION_EVENTS: "pull-request-and-push-verified",
+  }, process.cwd());
+  const body = Buffer.from(JSON.stringify({
+    action: "opened",
+    installation: {id: 123456},
+    repository: {id: 987654321, full_name: "OpenCoven/example", clone_url: "https://github.com/OpenCoven/example.git", default_branch: "main"},
+    pull_request: {
+      number: 17,
+      draft: false,
+      head: {sha: "a".repeat(40), ref: "feature/autoreview", repo: {id: 987654321, full_name: "OpenCoven/example"}},
+      base: {sha: "b".repeat(40), ref: "main"},
+    },
+  }));
+  const headers = {
+    "X-GitHub-Event": "pull_request",
+    "X-Hub-Signature-256": signature(secret, body),
+  };
+  const first = await callWebhook(body, {...headers, "X-GitHub-Delivery": "autoreview-delivery-one"}, "auto", config);
+  const second = await callWebhook(body, {...headers, "X-GitHub-Delivery": "autoreview-delivery-two"}, "auto", config);
+  assert.equal(first.body.action, "accepted");
+  assert.equal(second.body.action, "duplicate_task_queued");
+  assert.equal(first.body.task_id, second.body.task_id);
+  assert.equal(readdirSync(config.tasksDir).filter((name) => name.startsWith("autoreview-")).length, 1);
+});
+
+test("a successful repair creates one deterministic new-SHA follow-up task with loop history", async () => {
+  const config = testConfig(tempStateDir());
+  const parent: JsonObject = {
+    ...reviewTask("repair-parent"),
+    installation_id: 123456,
+    repository_id: 987654321,
+    clone_url: "https://github.com/OpenCoven/example.git",
+    default_branch: "main",
+    familiar: {id: "covencat", display_name: "Covencat", skills: []},
+    trigger: "pull_request_autoreview",
+    repair_iteration: 0,
+    target: {
+      kind: "pull_request",
+      pr_number: 7,
+      head_sha: "a".repeat(40),
+      head_ref: "feature/fix",
+      head_repo_id: 987654321,
+      head_repo: "OpenCoven/example",
+      base_sha: "b".repeat(40),
+      base_ref: "main",
+    },
+    task: {kind: "respond_to_mention", issue_number: 7, comment_body: "Review PR #7."},
+  };
+  const policy: JsonObject = {
+    enabled: true,
+    enabled_triggers: ["pull_request.synchronize", "pull_request.edited", "pull_request.reopened", "push"],
+    autoreview: {enabled: true},
+    repair: {enabled: true, max_attempts: 2},
+    publication: {mode: "comment", validation_commands: ["npm test"]},
+  };
+  const newHead = "c".repeat(40);
+  const first = await createFollowupReviewTask(config, parent, policy, newHead, "b".repeat(40), "finding-signature", newHead);
+  const second = await createFollowupReviewTask(config, parent, policy, newHead, "b".repeat(40), "finding-signature", newHead);
+  assert.equal(first, second);
+  const followup = JSON.parse(readFileSync(join(config.tasksDir, `${first}.json`), "utf8")) as JsonObject;
+  assert.equal(followup.state, "queued");
+  assert.equal(followup.parent_task_id, "repair-parent");
+  assert.equal(followup.repair_iteration, 1);
+  assert.equal((followup.target as JsonObject).head_sha, newHead);
+  assert.equal((followup.repair_history as JsonObject[])[0].finding_signature, "finding-signature");
+});
+
+test("repair eligibility fails closed for forks, protected branches, limits, repeats, and kill switches", () => {
+  const finding = {severity: "high", file: "src/app.ts", line: 12, title: "Validate input", body: "Missing validation.", recommendation: "Validate it."};
+  const result = completeReview([finding]);
+  const task: JsonObject = {
+    ...reviewTask("repair-eligibility"),
+    trigger: "pull_request_autoreview",
+    repository_id: 987654321,
+    default_branch: "main",
+    publication_requested_decision: "REQUEST_CHANGES",
+    publication_state: "published_review",
+    repair_iteration: 0,
+    repair_history: [],
+    target: {
+      kind: "pull_request",
+      pr_number: 7,
+      head_ref: "feature/fix",
+      head_repo_id: 987654321,
+      head_repo: "OpenCoven/example",
+      base_ref: "main",
+    },
+  };
+  const policy: JsonObject = {
+    enabled: true,
+    repair: {enabled: true, max_attempts: 2},
+    publication: {mode: "comment", validation_commands: ["npm test"]},
+  };
+  assert.equal(repairEligibilityIssue(task, result, policy), null);
+  assert.equal(repairEligibilityIssue({...task, target: {...(task.target as JsonObject), head_repo_id: 2}}, result, policy), "repair_fork_or_untrusted_head");
+  assert.equal(repairEligibilityIssue({...task, target: {...(task.target as JsonObject), head_ref: "main"}}, result, policy), "repair_protected_branch");
+  assert.equal(repairEligibilityIssue({...task, repair_iteration: 2}, result, policy), "repair_attempt_limit_reached");
+  assert.equal(repairEligibilityIssue(task, result, {...policy, kill_switch: true}), "repository_kill_switch");
+  const signatureProbe = {...task, repair_history: [{finding_signature: "placeholder"}]};
+  const initialIssue = repairEligibilityIssue(signatureProbe, result, policy);
+  assert.equal(initialIssue, null);
+  // Use the exported decision twice through an equivalent prior attempt by deriving
+  // the signature from a first successful task's follow-up-shaped history.
+  const signature = createHash("sha256").update(stableCompact([{
+    severity: "high", file: "src/app.ts", title: "validate input", recommendation: "validate it.",
+  }])).digest("hex");
+  assert.equal(repairEligibilityIssue({...task, repair_history: [{finding_signature: signature}]}, result, policy), "repair_repeated_findings");
+});
+
+test("trusted host repair diff inspection permits bounded source edits and rejects protected paths", () => {
+  const stateDir = tempStateDir();
+  const config = testConfig(stateDir);
+  const workspace = join(stateDir, "repair-fixture-repo");
+  const artifacts = join(stateDir, "repair-fixture-artifacts");
+  mkdirSync(join(workspace, "src"), {recursive: true});
+  mkdirSync(artifacts, {recursive: true});
+  writeFileSync(join(workspace, "src/app.ts"), "export const valid = false;\n");
+  execFileSync(config.hostGitBin, ["init", "-q", "-b", "feature/fix"], {cwd: workspace});
+  execFileSync(config.hostGitBin, ["add", "src/app.ts"], {cwd: workspace});
+  execFileSync(config.hostGitBin, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "fixture"], {cwd: workspace});
+  writeFileSync(join(workspace, "src/app.ts"), "export const valid = true;\n");
+  const resultPath = join(artifacts, "review-result.json");
+  writeFileSync(resultPath, JSON.stringify(completeReview([{
+    severity: "high",
+    file: "src/app.ts",
+    line: 1,
+    title: "Set valid state",
+    body: "The source leaves validation disabled.",
+    recommendation: "Enable it.",
+  }])));
+  const task = {...reviewTask("repair-diff"), result_path: resultPath};
+  const policy: JsonObject = {repair: {enabled: true, allowed_paths: ["src/**"], max_changed_files: 2, max_diff_bytes: 4096}};
+  const inspected = inspectRepairDiff(config, task, policy, workspace, artifacts);
+  assert.deepEqual(inspected.paths, ["src/app.ts"]);
+  assert.match(inspected.diff, /valid = true/);
+  assert.equal(inspected.diffSha256, createHash("sha256").update(inspected.diff).digest("hex"));
+
+  mkdirSync(join(workspace, ".github/workflows"), {recursive: true});
+  writeFileSync(join(workspace, ".github/workflows/untrusted.yml"), "permissions: write-all\n");
+  assert.throws(
+    () => inspectRepairDiff(config, task, {...policy, repair: {...(policy.repair as JsonObject), allowed_paths: ["**"]}}, workspace, artifacts),
+    /repair_protected_path:\.github\/workflows\/untrusted\.yml/,
+  );
+  rmSync(join(workspace, ".github"), {recursive: true, force: true});
+  execFileSync(config.hostGitBin, ["reset", "--hard", "HEAD"], {cwd: workspace});
+  assert.throws(() => inspectRepairDiff(config, task, policy, workspace, artifacts), /repair_non_progress/);
 });
 
 test("real tasks fail closed before GitHub calls when runtime isolation is disabled", async () => {
@@ -1238,7 +1483,7 @@ test("approves only a complete no-findings PR review", () => {
   assert.equal(normalized.decision, "APPROVE");
 });
 
-test("uses COMMENT for contradictory evidence and includes validation and GitHub file links", async () => {
+test("uses only trusted host receipts for test evidence and includes GitHub file links", async () => {
   const task = reviewTask();
   const result = completeReview();
   const review = result.review as JsonObject;
@@ -1246,26 +1491,34 @@ test("uses COMMENT for contradictory evidence and includes validation and GitHub
   result.summary = "npm test - not run";
   const normalized = normalizeReviewPublication(task, result);
 
-  assert.equal(normalized.decision, "COMMENT");
-  assert.equal(normalized.evidenceComplete, false);
-  assert.match(normalized.validationIssues.join("\n"), /contradictory/);
+  assert.equal(normalized.decision, "APPROVE");
+  assert.equal(normalized.evidenceComplete, true);
+  assert.deepEqual(normalized.review.tests_run, [{
+    command: "npm test",
+    status: "passed",
+    output_summary: "all tests passed",
+    receipt_sha256: (trustedValidationReceipt().receipt_sha256),
+    workspace_revision: "abc123",
+  }]);
 
   const stateDir = tempStateDir();
   const config = testConfig(stateDir);
   prepareReviewWorkspace(config, task);
   const resultPath = join(stateDir, "result.json");
   writeFileSync(resultPath, JSON.stringify(result));
-  let published = "";
+  let publishedBody = "";
+  let submittedEvent = "";
   await withGithubApiMock((url, init) => {
     const read = githubReadFixture(url, init);
     if (read) return read;
-    published = String(init.body);
-    return {id: 102, html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-102"};
+    const payload = JSON.parse(String(init.body)) as JsonObject;
+    if (/\/pulls\/7\/reviews$/.test(url)) publishedBody = String(payload.body || "");
+    if (/\/events$/.test(url)) submittedEvent = String(payload.event || "");
+    return {id: 102, state: submittedEvent === "APPROVE" ? "APPROVED" : "PENDING", html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-102"};
   }, async () => publishResultIfConfigured(config, task, resultPath, "token"));
 
-  assert.match(published, /"event":"COMMENT"/);
-  assert.match(published, /Publication validation/);
-  assert.match(published, /https:\/\/github\.com\/OpenCoven\/example\/blob\/abc123\/src\/app\.ts/);
+  assert.equal(submittedEvent, "APPROVE");
+  assert.match(publishedBody, /https:\/\/github\.com\/OpenCoven\/example\/blob\/abc123\/src\/app\.ts/);
 });
 
 test("a newer review links the prior covencat publication with conditional replacement wording", async () => {
@@ -1391,10 +1644,7 @@ test("downgrades incomplete, contradictory, or malformed review evidence", () =>
     ["runtime failure", (_task, result) => { result.status = "failure"; }],
     ["review limitation", (_task, result) => { (result.review as JsonObject).limitations = ["Tests were unavailable."]; }],
     ["missing no-findings reason", (_task, result) => { (result.review as JsonObject).no_findings_reason = null; }],
-    ["failed test", (_task, result) => { (result.review as JsonObject).tests_run = [{command: "npm test", status: "failed", output_summary: "1 failed"}]; }],
-    ["missing test evidence", (_task, result) => { (result.review as JsonObject).tests_run = []; }],
     ["malformed finding", (_task, result) => { (result.review as JsonObject).findings = [{title: "missing required fields"}]; (result.review as JsonObject).no_findings_reason = null; }],
-    ["findings with no-findings reason", (_task, result) => { (result.review as JsonObject).findings = [{severity: "high", file: "src/app.ts", line: 12, title: "Finding", body: "Body", recommendation: null}]; }],
     ["invalid supporting path", (_task, result) => { (result.review as JsonObject).supporting_files = ["435:  .map((entry) => entry)"]; }],
     ["truncated patch evidence", (task) => { (task.review_evidence as JsonObject).incomplete_patch_files = ["src/app.ts"]; }],
     ["wrong changed-file count", (task) => { (task.review_evidence as JsonObject).expected_changed_file_count = 3; }],
@@ -1415,7 +1665,7 @@ test("downgrades incomplete, contradictory, or malformed review evidence", () =>
   }
 });
 
-test("normalizes contradictory tests instead of publishing passed and not-run claims", async () => {
+test("replaces runtime-authored test claims with trusted host receipts", async () => {
   const stateDir = tempStateDir();
   const config = testConfig(stateDir);
   const task = reviewTask("normalized-contradiction");
@@ -1432,12 +1682,12 @@ test("normalizes contradictory tests instead of publishing passed and not-run cl
     payload = JSON.parse(String(init.body)) as JsonObject;
     return {id: 401, html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-401"};
   }, async () => publishResultIfConfigured(config, task, resultPath, "token"));
-  assert.equal(payload.event, "COMMENT");
-  assert.match(String(payload.body), /`unverified`/);
+  assert.equal(payload.event, "APPROVE");
   assert.doesNotMatch(String(payload.body), /Tests were not executed/);
+  assert.match(String(payload.body), /`passed`/);
 });
 
-test("downgrades passed test claims with failure or missing-execution evidence", () => {
+test("ignores untrusted runtime test narratives when trusted receipts pass", () => {
   const cases: Array<[string, (result: JsonObject) => void]> = [
     ["failed output", (result) => {
       (result.review as JsonObject).tests_run = [{command: "npm test", status: "passed", output_summary: "47 passed, 1 failed"}];
@@ -1481,10 +1731,9 @@ test("downgrades passed test claims with failure or missing-execution evidence",
     const result = completeReview();
     mutate(result);
     const normalized = normalizeReviewPublication(reviewTask(`failed-test-${name}`), result, "abc123");
-    assert.equal(normalized.decision, "COMMENT", name);
-    assert.equal(normalized.evidenceComplete, false, name);
-    assert.match(normalized.validationIssues.join("\n"), /contradictory or incomplete/, name);
-    assert.equal((normalized.review.tests_run as JsonObject[])[0].status, "unverified", name);
+    assert.equal(normalized.decision, "APPROVE", name);
+    assert.equal(normalized.evidenceComplete, true, name);
+    assert.equal((normalized.review.tests_run as JsonObject[])[0].status, "passed", name);
   }
 });
 
@@ -1538,12 +1787,7 @@ test("accepts a deletion finding when the changed file is absent from the checke
     changed_file_count: 1,
     expected_changed_file_count: 1,
     incomplete_patch_files: [],
-    host_validation_checks: [{
-      command: "npm test",
-      returncode: 0,
-      stdout_sha256: "a".repeat(64),
-      stderr_sha256: "b".repeat(64),
-    }],
+    host_validation_checks: [trustedValidationReceipt()],
     changed_files: ["src/deleted.ts"],
     changed_file_lines: [{path: "src/deleted.ts", left_lines: [9], right_lines: []}],
   };
