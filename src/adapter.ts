@@ -1,6 +1,6 @@
 import {createHash, createHmac, createSign, randomUUID, timingSafeEqual} from "node:crypto";
-import {closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync} from "node:fs";
-import {homedir, hostname} from "node:os";
+import {closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync} from "node:fs";
+import {homedir, hostname, tmpdir} from "node:os";
 import {basename, dirname, isAbsolute, join, relative, resolve, sep} from "node:path";
 import {spawnSync} from "node:child_process";
 
@@ -1333,6 +1333,7 @@ interface SandboxMounts {
   workspace: string;
   inputDir: string;
   outputDir: string;
+  codexCredential?: string;
 }
 
 export function runtimeSandboxArgs(
@@ -1393,6 +1394,22 @@ export function runtimeSandboxArgs(
     "--bind", workspace, "/workspace",
     "--bind", outputDir, "/run/coven/output",
   ];
+  if (mounts.codexCredential) {
+    const suppliedCredential = lstatSync(mounts.codexCredential);
+    if (suppliedCredential.isSymbolicLink()) {
+      throw new Error("Ephemeral Codex credential must not be a symbolic link");
+    }
+    const credential = realpathSync(mounts.codexCredential);
+    const details = lstatSync(credential);
+    const processUid = typeof process.getuid === "function" ? process.getuid() : details.uid;
+    if (details.isSymbolicLink() || !details.isFile() || details.uid !== processUid || (details.mode & 0o077) !== 0) {
+      throw new Error("Ephemeral Codex credential must be a private regular file owned by the service account");
+    }
+    args.push(
+      "--dir", "/home/coven/.coven-code",
+      "--ro-bind", credential, "/home/coven/.coven-code/codex_tokens.json",
+    );
+  }
   const gitDir = join(workspace, ".git");
   if (existsSync(gitDir) && statSync(gitDir).isDirectory()) {
     args.push("--ro-bind", realpathSync(gitDir), "/workspace/.git");
@@ -1533,6 +1550,25 @@ function sessionBrief(
   return brief;
 }
 
+export function withEphemeralCodexCredential<T>(
+  accessToken: string,
+  callback: (credentialPath: string) => T,
+): T {
+  if (!accessToken.trim()) throw new Error("Codex access token is empty");
+  const directory = mkdtempSync(join(tmpdir(), "covencat-codex-"));
+  const credentialPath = join(directory, "codex_tokens.json");
+  try {
+    writeFileSync(
+      credentialPath,
+      `${JSON.stringify({access_token: accessToken})}\n`,
+      {encoding: "utf8", mode: 0o600, flag: "wx"},
+    );
+    return callback(credentialPath);
+  } finally {
+    rmSync(directory, {recursive: true, force: true});
+  }
+}
+
 function runCovenCodeCycle(
   config: AdapterConfig,
   task: JsonObject,
@@ -1543,6 +1579,7 @@ function runCovenCodeCycle(
   cycle: number,
   extraAuditInstruction?: string,
   mode: "review" | "repair" = "review",
+  codexAccessToken?: string,
 ): CycleResult {
   const suffix = cycle === 0 ? "" : `-repair-${cycle}`;
   const inputDir = join(attemptDir, `runtime-input${suffix}`);
@@ -1556,9 +1593,10 @@ function runCovenCodeCycle(
   const sandboxResultPath = `/run/coven/output/result${suffix}.json`;
 
   writeJsonAtomic(briefPath, sessionBrief(task, "/workspace", reviewContext, extraAuditInstruction));
-  const run = runSandboxedCommand(
+  if (!codexAccessToken) throw new Error("Codex access token is required for hosted runtime cycles");
+  const run = withEphemeralCodexCredential(codexAccessToken, (codexCredential) => runSandboxedCommand(
     config,
-    {workspace, inputDir, outputDir},
+    {workspace, inputDir, outputDir, codexCredential},
     [
       config.covenCodeBin,
       "--headless",
@@ -1575,7 +1613,7 @@ function runCovenCodeCycle(
     env,
     1800,
     config.runtimeNetwork,
-  );
+  ));
   writeJsonAtomic(runPath, redactedCommandResult(run));
   let result: JsonObject | null = null;
   const acceptableExit = [0, 1, 3].includes(run.returncode) && !run.signal && !run.timed_out && !run.spawn_error;
@@ -1798,7 +1836,7 @@ async function runTaskUnlocked(config: AdapterConfig, taskId: string): Promise<J
       writeJsonAtomic(path, task);
     }
 
-    const firstCycle = runCovenCodeCycle(config, task, workspace, reviewContext, attemptDir, runtimeEnv, 0);
+    const firstCycle = runCovenCodeCycle(config, task, workspace, reviewContext, attemptDir, runtimeEnv, 0, undefined, "review", codexAccessToken);
     task.session_brief_path = firstCycle.brief_path;
     task.session_brief_sha256 = fileSha256(String(firstCycle.brief_path));
     task.runtime_exit_code = firstCycle.run.returncode;
@@ -2124,7 +2162,7 @@ async function maybeRunRepair(config: AdapterConfig, taskId: string, inputTask?:
     if (!codexAccessToken) return repairStop(path, task, "repair_codex_auth_missing");
     const currentTask = {...task, publication: currentPolicy.publication || {}, policy_snapshot: currentPolicy};
     const instruction = reviewFixInstruction(findings, iteration, boundedRepairAttempts(currentPolicy));
-    const repairCycle = runCovenCodeCycle(config, taskWithRepairRequest(currentTask, instruction), repairWorkspace, null, artifactDir, runtimeProcessEnvironment(process.env, codexAccessToken), iteration, instruction, "repair");
+    const repairCycle = runCovenCodeCycle(config, taskWithRepairRequest(currentTask, instruction), repairWorkspace, null, artifactDir, runtimeProcessEnvironment(process.env, codexAccessToken), iteration, instruction, "repair", codexAccessToken);
     task.repair_runtime_exit_code = repairCycle.run.returncode;
     task.repair_result_path = repairCycle.result_path;
     task.repair_brief_path = repairCycle.brief_path;
@@ -4469,6 +4507,7 @@ export function sanitizedRuntimeEnvironment(source: NodeJS.ProcessEnv): NodeJS.P
 }
 
 export function runtimeProcessEnvironment(source: NodeJS.ProcessEnv, codexAccessToken: string): NodeJS.ProcessEnv {
+  if (!codexAccessToken.trim()) throw new Error("Codex access token is empty");
   return {
     ...sanitizedRuntimeEnvironment(source),
     PATH: "/usr/local/bin:/usr/bin:/bin",
@@ -4477,7 +4516,6 @@ export function runtimeProcessEnvironment(source: NodeJS.ProcessEnv, codexAccess
     GIT_TERMINAL_PROMPT: "0",
     COVEN_CODE_PROVIDER: "codex",
     COVEN_CODE_HOSTED_REVIEW: "1",
-    OPENAI_API_KEY: codexAccessToken,
   };
 }
 

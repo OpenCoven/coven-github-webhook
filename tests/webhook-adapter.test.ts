@@ -37,6 +37,7 @@ import {
   runnableTaskIds,
   runTask,
   sanitizedRuntimeEnvironment,
+  withEphemeralCodexCredential,
   type JsonObject,
   type JsonValue,
 } from "../src/adapter.js";
@@ -1053,6 +1054,17 @@ test("runtime sandbox exposes only explicit mounts and runtime env omits GitHub 
   assert.ok(args.includes("/workspace/.git"));
   assert.equal(args.includes(config.privateKeyPath), false);
   assert.equal(args.includes(config.codexTokensPath), false);
+  withEphemeralCodexCredential("oauth-access-only", (codexCredential) => {
+    const credentialArgs = runtimeSandboxArgs(
+      config,
+      {workspace, inputDir, outputDir, codexCredential},
+      ["/usr/local/bin/coven-code", "--headless"],
+    );
+    const mountIndex = credentialArgs.findIndex((value, index) => value === "--ro-bind" && credentialArgs[index + 1] === codexCredential);
+    assert.notEqual(mountIndex, -1);
+    assert.equal(credentialArgs[mountIndex + 2], "/home/coven/.coven-code/codex_tokens.json");
+    assert.equal(credentialArgs.includes("refresh_token"), false);
+  });
   const runtimeEnv = runtimeProcessEnvironment({
     PATH: "/host/bin",
     HOME: "/host/home",
@@ -1063,10 +1075,22 @@ test("runtime sandbox exposes only explicit mounts and runtime env omits GitHub 
     SSH_AUTH_SOCK: "/tmp/agent",
   }, "codex-only");
   assert.equal(runtimeEnv.HOME, "/home/coven");
-  assert.equal(runtimeEnv.OPENAI_API_KEY, "codex-only");
+  assert.equal(runtimeEnv.OPENAI_API_KEY, undefined);
   for (const key of ["GITHUB_APP_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "COVEN_GIT_TOKEN", "GIT_ASKPASS", "SSH_AUTH_SOCK"]) {
     assert.equal(runtimeEnv[key], undefined);
   }
+});
+
+test("Codex OAuth reaches the sandbox only through a private ephemeral token file", () => {
+  let credentialPath = "";
+  const result = withEphemeralCodexCredential("oauth-access-only", (path) => {
+    credentialPath = path;
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), {access_token: "oauth-access-only"});
+    assert.equal(statSync(path).mode & 0o077, 0);
+    return "mounted";
+  });
+  assert.equal(result, "mounted");
+  assert.equal(existsSync(credentialPath), false);
 });
 
 test("runtime result reader rejects symlinks and oversized artifacts", () => {
