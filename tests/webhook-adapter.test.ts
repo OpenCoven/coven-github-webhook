@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,7 @@ import {
   githubRequestAllPages,
   handleRequest,
   inspectRepairDiff,
+  loadFreshCodexAccessToken,
   normalizeReviewPublication,
   patchEvidenceIncomplete,
   publicationInstallationTokenRequest,
@@ -3154,6 +3155,49 @@ test("redacts credentials and passes only allowlisted ambient environment keys",
     GITHUB_WEBHOOK_SECRET: "webhook-secret",
   });
   assert.deepEqual(env, {PATH: "/bin", LANG: "C.UTF-8"});
+});
+
+test("host refreshes OAuth privately and passes only the current access token", async () => {
+  const stateDir = tempStateDir();
+  const tokenDir = join(stateDir, "oauth");
+  const tokenPath = join(tokenDir, "codex_tokens.json");
+  mkdirSync(tokenDir, {recursive: true, mode: 0o700});
+  writeFileSync(tokenPath, JSON.stringify({
+    access_token: "expired-access",
+    refresh_token: "private-refresh",
+    account_id: "account",
+    expires_at: Math.floor(Date.now() / 1000) - 60,
+  }), {mode: 0o600});
+  const config = createConfig({
+    COVEN_GITHUB_STATE_DIR: stateDir,
+    COVEN_GITHUB_POLICY_PATH: join(stateDir, "policy.json"),
+    COVEN_CODE_CODEX_TOKENS_PATH: tokenPath,
+  }, process.cwd());
+  let requests = 0;
+  const refreshed = await loadFreshCodexAccessToken(config, async (input, init) => {
+    requests += 1;
+    assert.equal(String(input), "https://auth.openai.com/oauth/token");
+    assert.equal(init?.method, "POST");
+    const request = JSON.parse(String(init?.body)) as JsonObject;
+    assert.equal(request.refresh_token, "private-refresh");
+    return new Response(JSON.stringify({
+      access_token: "fresh-access",
+      refresh_token: "rotated-refresh",
+      expires_in: 3600,
+    }), {status: 200});
+  });
+  assert.equal(refreshed, "fresh-access");
+  assert.equal(requests, 1);
+  const stored = JSON.parse(readFileSync(tokenPath, "utf8")) as JsonObject;
+  assert.equal(stored.access_token, "fresh-access");
+  assert.equal(stored.refresh_token, "rotated-refresh");
+  assert.ok(Number(stored.expires_at) > Math.floor(Date.now() / 1000) + 3000);
+  assert.equal((statSync(tokenPath).mode & 0o077), 0);
+
+  const reused = await loadFreshCodexAccessToken(config, async () => {
+    throw new Error("fresh tokens must not refresh");
+  });
+  assert.equal(reused, "fresh-access");
 });
 
 test("preserves a useful redacted provider diagnostic for failed reviews", async () => {

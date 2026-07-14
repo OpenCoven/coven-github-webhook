@@ -1762,7 +1762,12 @@ async function runTaskUnlocked(config: AdapterConfig, taskId: string): Promise<J
       COVEN_GIT_TOKEN: gitToken,
       HOME: gitHome,
     };
-    const codexAccessToken = loadCodexAccessToken(config);
+    let codexAccessToken: string | null;
+    try {
+      codexAccessToken = await loadFreshCodexAccessToken(config);
+    } catch (error) {
+      return failTask(path, task, "codex_auth_refresh_failed", String((error as Error).message || error));
+    }
     if (!codexAccessToken) {
       return failTask(path, task, "codex_auth_missing", `Missing Codex access token at ${config.codexTokensPath}`);
     }
@@ -2110,7 +2115,12 @@ async function maybeRunRepair(config: AdapterConfig, taskId: string, inputTask?:
     if (clone.returncode !== 0) return repairStop(path, task, "repair_clone_failed", clone.stderr);
     const clonedHead = runCommand([config.hostGitBin, "rev-parse", "HEAD"], repairWorkspace, gitEnv, 30);
     if (clonedHead.returncode !== 0 || clonedHead.stdout.trim() !== evidenceRevision.headSha) return repairStop(path, task, "repair_fresh_head_mismatch", clonedHead.stdout || clonedHead.stderr);
-    const codexAccessToken = loadCodexAccessToken(config);
+    let codexAccessToken: string | null;
+    try {
+      codexAccessToken = await loadFreshCodexAccessToken(config);
+    } catch (error) {
+      return repairStop(path, task, "repair_codex_auth_refresh_failed", String((error as Error).message || error));
+    }
     if (!codexAccessToken) return repairStop(path, task, "repair_codex_auth_missing");
     const currentTask = {...task, publication: currentPolicy.publication || {}, policy_snapshot: currentPolicy};
     const instruction = reviewFixInstruction(findings, iteration, boundedRepairAttempts(currentPolicy));
@@ -4329,19 +4339,70 @@ function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] 
   return lines;
 }
 
-function loadCodexAccessToken(config: AdapterConfig): string | null {
-  for (const path of codexTokenCandidates(config)) {
-    try {
-      const data = readJson<JsonObject>(path, {});
-      const token = String(data.access_token || "").trim();
-      if (token) {
-        return token;
-      }
-    } catch {
-      continue;
+const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+function readCodexTokenCandidate(path: string): JsonObject | null {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const details = fstatSync(descriptor);
+    const processUid = typeof process.getuid === "function" ? process.getuid() : details.uid;
+    if (!details.isFile() || details.size > 64 * 1024 || details.uid !== processUid || (details.mode & 0o077) !== 0) {
+      throw new Error("Codex OAuth token file is not a private regular file owned by the service account");
     }
+    const parsed = JSON.parse(readFileSync(descriptor, "utf8")) as JsonValue;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Codex OAuth token file is not a JSON object");
+    return parsed as JsonObject;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
-  return null;
+}
+
+export async function loadFreshCodexAccessToken(
+  config: AdapterConfig,
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<string | null> {
+  const lock = await acquirePublicationLock(config, "codex-oauth-refresh");
+  try {
+    for (const path of codexTokenCandidates(config)) {
+      const data = readCodexTokenCandidate(path);
+      if (!data) continue;
+      const accessToken = String(data.access_token || "").trim();
+      if (!accessToken) continue;
+      const expiresAt = Number(data.expires_at || 0);
+      if (!Number.isFinite(expiresAt) || expiresAt <= 0 || expiresAt > Math.floor(Date.now() / 1000) + 300) {
+        return accessToken;
+      }
+      const refreshToken = String(data.refresh_token || "").trim();
+      if (!refreshToken) throw new Error("Codex OAuth access token expired without a refresh token");
+      const response = await fetcher(CODEX_OAUTH_TOKEN_URL, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({grant_type: "refresh_token", client_id: CODEX_OAUTH_CLIENT_ID, refresh_token: refreshToken}),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!response.ok) throw new Error(`Codex OAuth token refresh failed with HTTP ${response.status}`);
+      const refreshed = await response.json() as JsonObject;
+      const newAccessToken = String(refreshed.access_token || "").trim();
+      if (!newAccessToken) throw new Error("Codex OAuth token refresh response omitted the access token");
+      const expiresIn = Number(refreshed.expires_in || 0);
+      const updated: JsonObject = {
+        ...data,
+        access_token: newAccessToken,
+        refresh_token: String(refreshed.refresh_token || "").trim() || refreshToken,
+        ...(Number.isFinite(expiresIn) && expiresIn > 0 ? {expires_at: Math.floor(Date.now() / 1000) + Math.trunc(expiresIn)} : {}),
+      };
+      writeJsonAtomic(path, updated);
+      return newAccessToken;
+    }
+    return null;
+  } finally {
+    releasePublicationLock(lock);
+  }
 }
 
 function codexTokenCandidates(config: AdapterConfig): string[] {

@@ -1,6 +1,7 @@
 [Unit]
 Description=Covencat immutable GitHub review worker
-After=network-online.target
+Requires=covencat-state-volume.service
+After=network-online.target covencat-state-volume.service
 Wants=network-online.target
 
 [Service]
@@ -9,7 +10,7 @@ Environment=CONFIG_ROOT=%h/.config/covencat-worker
 Environment=STATE_ROOT=%h/.local/share/covencat-worker
 # STATE_ROOT must be a persistent filesystem of at most 8 GiB. The container
 # independently measures it and refuses startup when it is larger.
-ExecStartPre=/usr/bin/mkdir -p ${STATE_ROOT}
+ExecStartPre=/usr/bin/mountpoint -q ${STATE_ROOT}
 ExecStart=/usr/bin/podman run --rm --replace --name covencat-worker \
   --read-only \
   --userns=keep-id \
@@ -24,7 +25,7 @@ ExecStart=/usr/bin/podman run --rm --replace --name covencat-worker \
   --env-file=${CONFIG_ROOT}/worker.env \
   --volume=${CONFIG_ROOT}/policy.json:/run/coven-config/policy.json:ro,Z \
   --volume=${CONFIG_ROOT}/github-app.pem:/run/coven-config/github-app.pem:ro,Z \
-  --volume=${CONFIG_ROOT}/codex:/run/coven-config/codex:ro,Z \
+  --volume=${CONFIG_ROOT}/codex:/run/coven-config/codex:rw,Z \
   --volume=${STATE_ROOT}:/var/lib/coven:rw,Z \
   localhost/covencat-worker@${IMAGE_DIGEST}
 ExecStop=/usr/bin/podman stop --time 30 covencat-worker

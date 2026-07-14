@@ -203,6 +203,16 @@ the live installation has pull-request and push subscriptions plus the exact
 Contents, Pull requests, Issues, and Metadata authority needed by review and
 repair. A checked-in manifest is not evidence of the live App settings.
 
+When public ingress and the sandbox host are separate, keep all App and model
+credentials on the sandbox host. The reference ingress relay forwards raw
+headers and bodies to a loopback-only reverse port and holds no secrets. Restrict
+its SSH key server-side with `restrict,port-forwarding,permitopen="none"` and an
+exact `permitlisten` for that one loopback port. Pin the host key, bind both ends
+to loopback, and never expose the worker port directly to the LAN or Internet.
+The state-volume example uses a fixed-size ext4 image through FUSE so attempts
+and recovery artifacts persist while the entrypoint's 8 GiB hard check remains
+meaningful.
+
 This release passes the model credential to `coven-code`, so an untrusted
 checkout can still try to consume or encode it through the allowed model
 channel. Limit real execution to trusted repositories. Supporting public or
@@ -210,6 +220,11 @@ otherwise untrusted pull requests requires a separately constrained worker and
 a quota-limited credential broker that does not expose a reusable model token
 to repository code; the declaration above must remain unset until that boundary
 is actually deployed.
+
+Mount the Codex token directory writable only by the service account. The host
+refreshes an access token within five minutes of expiry, atomically persists the
+rotated OAuth record, and passes only the access token into bubblewrap. The
+refresh token and account registry are never mounted into a task sandbox.
 
 The adapter mounts only per-task input (read-only), the checkout and result
 directory (writable), and the checkout `.git` directory again as read-only. It

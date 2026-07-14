@@ -69,6 +69,10 @@ The deployment expects secrets and mutable state to be supplied outside git:
   opted into explicitly; `kill_switch` stops new routing and repair pushes.
 - Codex OAuth tokens under the deployed account's `.coven-code` directory
 
+The host refreshes an expiring Codex OAuth session through the fixed OpenAI
+token endpoint and atomically updates the private token file. Only the resulting
+short-lived access token enters the model sandbox; the refresh token never does.
+
 Do not commit private keys, webhook secrets, OAuth tokens, generated task state,
 workspaces, or attempt artifacts.
 
