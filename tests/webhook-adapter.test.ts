@@ -27,6 +27,7 @@ import {
   publishResultIfConfigured,
   readBoundedRuntimeResult,
   recoverPendingPublications,
+  redactedCommandResult,
   redactTokenish,
   reviewContextInstallationTokenRequest,
   resumeTaskPublication,
@@ -3261,6 +3262,21 @@ test("redacts credentials and passes only allowlisted ambient environment keys",
   ].join("\n");
   const redacted = redactTokenish(secretText);
   assert.doesNotMatch(redacted, /1234567890|topsecret|password|private-data|eyJabc|reviewer@example\.com|reviewer \(/);
+  const artifact = redactedCommandResult({
+    args: ["git", "-c", "user.email=reviewer@example.com", "https://x-access-token:ghs_1234567890@github.com/OpenCoven/example.git"],
+    returncode: 1,
+    stdout: "Bearer topsecret",
+    stderr: "reviewer@example.com",
+    signal: null,
+    timed_out: false,
+    duration_ms: 1,
+    stdout_truncated: false,
+    stderr_truncated: false,
+    output_limit_bytes: 1024,
+    spawn_error: "failed for reviewer@example.com",
+  });
+  assert.doesNotMatch(JSON.stringify(artifact), /1234567890|topsecret|reviewer@example\.com/);
+  assert.deepEqual(artifact.args, ["git", "-c", "user.email=[redacted email]", "https://[redacted]@github.com/OpenCoven/example.git"]);
   const env = sanitizedRuntimeEnvironment({
     PATH: "/bin", LANG: "C.UTF-8", SSH_AUTH_SOCK: "/tmp/agent.sock",
     DATABASE_URL: "postgres://user:pass@db", AWS_ACCESS_KEY_ID: "AKIASECRET",

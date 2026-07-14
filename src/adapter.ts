@@ -4520,12 +4520,14 @@ function codexTokenCandidates(config: AdapterConfig): string[] {
   return candidates;
 }
 
-function redactedCommandResult(result: CommandResult): JsonObject {
+export function redactedCommandResult(result: CommandResult): JsonObject {
   const diagnostic = runtimeDiagnostic(result);
   return {
     ...result,
+    args: result.args.map((arg) => redactTokenish(arg)),
     stdout: redactTokenish(result.stdout),
     stderr: redactTokenish(result.stderr),
+    spawn_error: redactTokenish(result.spawn_error),
     ...(diagnostic ? {runtime_diagnostic: diagnostic} : {}),
   };
 }
@@ -4582,14 +4584,14 @@ export function redactTokenish(text: string): string {
   }
   return text
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted private key]")
+    .replace(/(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi, "$1[redacted]@")
+    .replace(/x-access-token:[^@\s'\"]+/gi, "x-access-token:[redacted]")
     .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_-]{6,}/g, "[redacted github token]")
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}/g, "[redacted OpenAI token]")
     .replace(/\bBearer\s+[^\s'\"]+/gi, "Bearer [redacted]")
     .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted email]")
     .replace(/\bon account\s+`?[^`\n.]+`?/gi, "on the configured account")
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted JWT]")
-    .replace(/x-access-token:[^@\s'\"]+/gi, "x-access-token:[redacted]")
-    .replace(/(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi, "$1[redacted]@");
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted JWT]");
 }
 
 function failTask(path: string, task: JsonObject, reason: string, detail: string): JsonObject {
