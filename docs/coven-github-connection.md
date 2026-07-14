@@ -173,6 +173,32 @@ controls. A state directory from an older deployment must be owned by the
 service user and made inaccessible to group/other (for example, `chmod -R go-rwx
 "$COVEN_GITHUB_STATE_DIR"`) before this version starts.
 
+The checked-in [`deploy/Containerfile`](../deploy/Containerfile) is the
+reference production boundary. It resolves the fixed GitHub and Codex endpoint
+allowlist while building the immutable image, installs those addresses into
+both the service and sandbox root filesystems, and applies a default-deny nft
+output policy before dropping all capabilities. DNS, loopback, LAN, metadata,
+IPv6, and non-HTTPS egress remain blocked; the only private-address exception is
+the container's fixed self-address on the webhook listener port, which rootless
+Podman uses to deliver ingress. The example user service additionally
+sets cgroup memory, CPU, PID, file-descriptor, process, tmpfs, and read-only
+root-filesystem limits. Mount `COVEN_GITHUB_STATE_DIR` from a dedicated,
+persistent filesystem no larger than 8 GiB; the entrypoint measures the backing
+filesystem and refuses startup above `COVEN_STATE_FILESYSTEM_MAX_BYTES`. Build
+input `deploy/artifacts/coven-code` must be the tested binary for the recorded
+Coven Code revision; the directory is ignored by git and must never contain
+credentials.
+
+Always start the resulting image by digest, retain the previous digest for
+rollback, and verify the image labels, nft rules, zero effective capabilities,
+allowed GitHub/Codex reachability, rejected non-allowlisted egress, health
+endpoint, and signed-webhook rejection before enabling publication. If an
+allowlisted service changes addresses, build and verify a new immutable image;
+do not enable DNS or widen the runtime network as a shortcut.
+Run `node /usr/share/coven/probe-runtime.mjs` with the production mounts and
+environment to execute the same bubblewrap read/write/network probe used by a
+real task before promotion.
+
 This release passes the model credential to `coven-code`, so an untrusted
 checkout can still try to consume or encode it through the allowed model
 channel. Limit real execution to trusted repositories. Supporting public or
@@ -183,7 +209,9 @@ is actually deployed.
 
 The adapter mounts only per-task input (read-only), the checkout and result
 directory (writable), and the checkout `.git` directory again as read-only. It
-passes no GitHub token, askpass helper, App secret, SSH agent, or parent home to
+uses an empty `/proc` in the private PID namespace, avoiding host procfs exposure
+and nested procfs-mount authority. It passes no GitHub token, askpass helper,
+App secret, SSH agent, or parent home to
 `coven-code`. Publication authority is minted only after the sandbox exits.
 Validation commands run again without credentials or network access. If the
 host cannot satisfy this boundary, leave real execution disabled and use demo

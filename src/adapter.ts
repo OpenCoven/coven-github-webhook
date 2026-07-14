@@ -1377,7 +1377,9 @@ export function runtimeSandboxArgs(
     "--unshare-cgroup-try",
     "--cap-drop", "ALL",
     "--ro-bind", rootfs, "/",
-    "--proc", "/proc",
+    // Keep the PID namespace private without requiring a nested procfs mount,
+    // which rootless OCI workers cannot safely grant.
+    "--dir", "/proc",
     "--dev", "/dev",
     "--tmpfs", "/tmp",
     "--tmpfs", "/home",

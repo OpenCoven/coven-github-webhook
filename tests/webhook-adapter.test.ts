@@ -1046,6 +1046,9 @@ test("runtime sandbox exposes only explicit mounts and runtime env omits GitHub 
   assert.match(argv, new RegExp(`--bind\\0${workspace}\\0/workspace`));
   assert.match(argv, new RegExp(`--bind\\0${outputDir}\\0/run/coven/output`));
   assert.ok(args.includes("--unshare-net"));
+  const procDirIndex = args.findIndex((value, index) => value === "--dir" && args[index + 1] === "/proc");
+  assert.notEqual(procDirIndex, -1);
+  assert.equal(args.includes("--proc"), false);
   assert.ok(args.includes("/workspace/.git"));
   assert.equal(args.includes(config.privateKeyPath), false);
   assert.equal(args.includes(config.codexTokensPath), false);

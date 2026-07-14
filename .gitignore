@@ -9,3 +9,4 @@ keys/
 coven-github-policy.json
 coven-github-state/
 .coven-github-private-key.pem
+deploy/artifacts/

@@ -83,7 +83,9 @@ records the task as `runtime_isolation_unavailable` with no direct fallback.
 The runtime rootfs must contain the configured `coven-code`, `git`, and shell
 executables plus their libraries, CA/DNS files, and approved runtime assets. It
 must not contain the GitHub App key, webhook state, policy, parent home, or Codex
-token store. The runtime receives only its dedicated model credential; it never
+token store. The private PID namespace receives an empty `/proc`, avoiding host
+procfs exposure and nested procfs-mount authority. The runtime receives only its
+dedicated model credential; it never
 receives a GitHub token or Git askpass helper. Shared networking is not an
 egress-confidentiality boundary, so use a dedicated, revocable model credential
 and an externally enforced allowlist that blocks loopback, LAN, and metadata

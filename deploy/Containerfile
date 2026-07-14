@@ -1,0 +1,73 @@
+ARG NODE_IMAGE=docker.io/library/node@sha256:242549cd46785b480c832479a730f4f2a20865d61ea2e404fdb2a5c3d3b73ecf
+
+FROM ${NODE_IMAGE} AS egress
+ARG COVEN_BUILD_EGRESS_HOSTS="github.com api.github.com chatgpt.com auth.openai.com"
+ENV COVEN_BUILD_EGRESS_HOSTS=${COVEN_BUILD_EGRESS_HOSTS}
+COPY deploy/resolve-egress.mjs /resolve-egress.mjs
+RUN node /resolve-egress.mjs
+
+FROM ${NODE_IMAGE} AS build
+WORKDIR /src
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
+
+FROM ${NODE_IMAGE} AS sandbox-rootfs
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git libasound2 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=egress /out/hosts /etc/hosts
+COPY deploy/artifacts/coven-code /usr/local/bin/coven-code
+RUN chmod 0755 /usr/local/bin/coven-code \
+ && mkdir -p /workspace \
+ && test -x /usr/bin/git \
+ && test -x /bin/sh \
+ && test -x /bin/true
+
+FROM ${NODE_IMAGE} AS runtime
+ARG WEBHOOK_REVISION
+ARG COVEN_CODE_REVISION
+ARG COVEN_CODE_BINARY_SHA256
+LABEL org.opencontainers.image.revision=${WEBHOOK_REVISION}
+LABEL tech.complete.coven-code.revision=${COVEN_CODE_REVISION}
+LABEL tech.complete.coven-code.binary-sha256=${COVEN_CODE_BINARY_SHA256}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bubblewrap ca-certificates git nftables tini util-linux \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=egress /out/hosts /etc/hosts
+COPY --from=egress /out/egress-ipv4.txt /usr/share/coven/egress-ipv4.txt
+COPY --from=egress /out/egress-hosts.txt /usr/share/coven/egress-hosts.txt
+COPY deploy/probe-runtime.mjs /usr/share/coven/probe-runtime.mjs
+COPY --from=sandbox-rootfs / /opt/coven-runtime/rootfs
+COPY --from=build /src/dist /app/dist
+COPY --from=build /src/node_modules /app/node_modules
+COPY package.json package-lock.json /app/
+COPY deploy/worker-entrypoint.sh /usr/local/bin/coven-worker-entrypoint
+RUN chmod 0755 /usr/local/bin/coven-worker-entrypoint \
+ && mkdir -p /var/lib/coven /run/coven-config /home/coven-service \
+ && chown 1000:1000 /var/lib/coven /home/coven-service \
+ && chmod 0700 /var/lib/coven /run/coven-config /home/coven-service
+WORKDIR /app
+ENV NODE_ENV=production \
+    HOME=/home/coven-service \
+    PORT=3000 \
+    COVEN_GITHUB_STATE_DIR=/var/lib/coven \
+    COVEN_GITHUB_POLICY_PATH=/run/coven-config/policy.json \
+    GITHUB_APP_PRIVATE_KEY_PATH=/run/coven-config/github-app.pem \
+    COVEN_CODE_CODEX_TOKENS_PATH=/run/coven-config/codex/codex_tokens.json \
+    COVEN_RUNTIME_ISOLATION=bwrap \
+    COVEN_RUNTIME_EXTERNAL_ISOLATION=network-egress-and-resource-limits-verified \
+    COVEN_GITHUB_REVOCATION_EVENTS=pull-request-and-push-verified \
+    COVEN_BWRAP_BIN=/usr/bin/bwrap \
+    COVEN_RUNTIME_ROOTFS=/opt/coven-runtime/rootfs \
+    COVEN_CODE_BIN=/usr/local/bin/coven-code \
+    COVEN_RUNTIME_GIT_BIN=/usr/bin/git \
+    COVEN_RUNTIME_SHELL_BIN=/bin/sh \
+    COVEN_HOST_GIT_BIN=/usr/bin/git \
+    COVEN_RUNTIME_NETWORK=shared \
+    COVEN_STATE_FILESYSTEM_MAX_BYTES=8589934592
+EXPOSE 3000
+ENTRYPOINT ["/usr/local/bin/coven-worker-entrypoint"]
+CMD ["node", "dist/src/server.js"]
