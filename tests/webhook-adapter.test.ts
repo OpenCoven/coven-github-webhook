@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   buildTaskFromEvent,
+  createFreshTaskAttemptDirectory,
   createConfig,
   githubRequestAllPages,
   handleRequest,
@@ -24,6 +25,7 @@ import {
   resumeTaskPublication,
   runtimeInstallationTokenRequest,
   runtimeIsolationIssue,
+  runtimeDiagnostic,
   runtimeProcessEnvironment,
   runtimeSandboxArgs,
   runnableTaskIds,
@@ -2893,17 +2895,69 @@ test("redacts credentials and passes only allowlisted ambient environment keys",
   const secretText = [
     "ghs_1234567890", "ghp_1234567890", "github_pat_1234567890",
     "sk-proj-1234567890", "Bearer topsecret", "eyJabc.def.ghi",
+    "API error 429 on account `reviewer (reviewer@example.com)`.",
     "https://user:password@example.com/path",
     "-----BEGIN PRIVATE KEY-----\nprivate-data\n-----END PRIVATE KEY-----",
   ].join("\n");
   const redacted = redactTokenish(secretText);
-  assert.doesNotMatch(redacted, /1234567890|topsecret|password|private-data|eyJabc/);
+  assert.doesNotMatch(redacted, /1234567890|topsecret|password|private-data|eyJabc|reviewer@example\.com|reviewer \(/);
   const env = sanitizedRuntimeEnvironment({
     PATH: "/bin", LANG: "C.UTF-8", SSH_AUTH_SOCK: "/tmp/agent.sock",
     DATABASE_URL: "postgres://user:pass@db", AWS_ACCESS_KEY_ID: "AKIASECRET",
     GITHUB_WEBHOOK_SECRET: "webhook-secret",
   });
   assert.deepEqual(env, {PATH: "/bin", LANG: "C.UTF-8"});
+});
+
+test("preserves a useful redacted provider diagnostic for failed reviews", async () => {
+  const diagnostic = runtimeDiagnostic({
+    args: ["coven-code", "--headless"],
+    returncode: 2,
+    stdout: "",
+    stderr: "API error 429: rate limit for model `gpt-5.4-mini` on account `reviewer (reviewer@example.com)`. Bearer topsecret sk-proj-1234567890\nProvider: codex",
+    signal: null,
+    timed_out: false,
+    spawn_error: "",
+  });
+  assert.match(String(diagnostic), /API error 429/);
+  assert.match(String(diagnostic), /gpt-5\.4-mini/);
+  assert.match(String(diagnostic), /configured account/);
+  assert.doesNotMatch(String(diagnostic), /reviewer@example\.com|reviewer \(|topsecret|1234567890/);
+
+  const stateDir = tempStateDir();
+  const config = testConfig(stateDir);
+  const task = reviewTask("provider-failure-diagnostic");
+  task.runtime_diagnostic = diagnostic;
+  prepareReviewWorkspace(config, task);
+  const result = completeReview();
+  result.status = "failure";
+  const resultPath = join(stateDir, "provider-failure.json");
+  writeFileSync(resultPath, JSON.stringify(result));
+  let payload: JsonObject = {};
+  await withGithubApiMock((url, init) => {
+    const read = githubReadFixture(url, init);
+    if (read) return read;
+    payload = JSON.parse(String(init.body)) as JsonObject;
+    return {id: 409, state: "PENDING", html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-409"};
+  }, async () => publishResultIfConfigured(config, task, resultPath, "token"));
+  assert.equal(payload.event, "COMMENT");
+  assert.match(String(payload.body), /### Runtime diagnostic/);
+  assert.match(String(payload.body), /API error 429/);
+  assert.doesNotMatch(String(payload.body), /reviewer@example\.com|reviewer \(|topsecret|1234567890/);
+});
+
+test("creates isolated attempt directories and refuses stale artifact reuse", () => {
+  const root = tempStateDir();
+  const first = createFreshTaskAttemptDirectory(root, "review-task", 1, "test attempt");
+  writeFileSync(join(first, "run.json"), "stale artifact\n");
+  const second = createFreshTaskAttemptDirectory(root, "review-task", 2, "test attempt");
+  assert.notEqual(first, second);
+  assert.equal(readFileSync(join(first, "run.json"), "utf8"), "stale artifact\n");
+  assert.deepEqual(readdirSync(second), []);
+  assert.throws(
+    () => createFreshTaskAttemptDirectory(root, "review-task", 1, "test attempt"),
+    /already exists/,
+  );
 });
 
 test("keeps idempotency marker after truncating and redacts issue publication text", async () => {
