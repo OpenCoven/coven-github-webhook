@@ -1,7 +1,7 @@
-import {createHash, createHmac, createSign, randomUUID} from "node:crypto";
-import {existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync} from "node:fs";
+import {createHash, createHmac, createSign, randomUUID, timingSafeEqual} from "node:crypto";
+import {existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync} from "node:fs";
 import {homedir} from "node:os";
-import {basename, dirname, join, resolve} from "node:path";
+import {basename, dirname, join, resolve, sep} from "node:path";
 import {spawnSync} from "node:child_process";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
@@ -54,6 +54,18 @@ interface CycleResult {
   run_path: string;
   run: CommandResult;
   result: JsonObject | null;
+}
+
+class GithubApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly responseBody: string,
+    method: string,
+    url: string,
+  ) {
+    super(`GitHub API ${method} ${url} failed (${status}): ${responseBody}`);
+    this.name = "GithubApiError";
+  }
 }
 
 const DEFAULT_POLICY: JsonObject = {
@@ -198,6 +210,7 @@ async function githubRequest(
 ): Promise<JsonValue> {
   const response = await fetch(url, {
     method,
+    signal: AbortSignal.timeout(30_000),
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
@@ -209,9 +222,21 @@ async function githubRequest(
   });
   const raw = await response.text();
   if (!response.ok) {
-    throw new Error(`GitHub API ${method} ${url} failed: ${raw}`);
+    throw new GithubApiError(response.status, raw, method, url);
   }
   return raw ? (JSON.parse(raw) as JsonValue) : {};
+}
+
+export async function githubRequestAllPages(url: string, token: string): Promise<JsonObject[]> {
+  const items: JsonObject[] = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const separator = url.includes("?") ? "&" : "?";
+    const response = await githubRequest("GET", `${url}${separator}per_page=100&page=${page}`, token);
+    if (!Array.isArray(response)) throw new Error(`GitHub paginated response was not an array: ${url}`);
+    items.push(...(response as JsonObject[]));
+    if (response.length < 100) return items;
+  }
+  throw new Error(`GitHub paginated response exceeded 100 pages: ${url}`);
 }
 
 async function installationToken(config: AdapterConfig, installationId: JsonValue | undefined): Promise<string> {
@@ -596,6 +621,7 @@ async function routeDelivery(
   const task = buildTaskFromEvent(eventName, deliveryId, payload, policy);
   task.policy_snapshot = {
     enabled_triggers: policy.enabled_triggers || [],
+    bot_usernames: policy.bot_usernames || [],
     publication: policy.publication || {mode: "record_only"},
   };
   writeJsonAtomic(taskPath(config, String(task.task_id)), task);
@@ -800,7 +826,7 @@ async function runTask(config: AdapterConfig, taskId: string): Promise<JsonObjec
     const token = await installationToken(config, task.installation_id);
     const askpass = writeAskpass(attemptDir);
     const env: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...sanitizedRuntimeEnvironment(process.env),
       GIT_ASKPASS: askpass,
       GIT_TERMINAL_PROMPT: "0",
       COVEN_GIT_TOKEN: token,
@@ -887,12 +913,23 @@ async function runTask(config: AdapterConfig, taskId: string): Promise<JsonObjec
     task.result_path = finalCycle.result_path;
     task.state = [0, 1, 3].includes(finalCycle.run.returncode) ? "completed" : "failed";
     task.updated_at = utcNow();
+    refreshPublicationWorkspaceEvidence(task, workspace, env);
     await publishResultIfConfigured(config, task, String(finalCycle.result_path), token);
     writeJsonAtomic(path, task);
     return task;
   } catch (error) {
     return failTask(path, task, "infra_error", String((error as Error).stack || error));
   }
+}
+
+function refreshPublicationWorkspaceEvidence(task: JsonObject, workspace: string, env: NodeJS.ProcessEnv): void {
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  if (!Object.keys(evidence).length) return;
+  const head = runCommand(["git", "rev-parse", "HEAD"], workspace, env, 30);
+  const status = runCommand(["git", "status", "--porcelain"], workspace, env, 30);
+  evidence.publication_workspace_head_sha = head.returncode === 0 ? head.stdout.trim() : "";
+  evidence.publication_workspace_clean = status.returncode === 0 && status.stdout.trim() === "";
+  task.review_evidence = evidence;
 }
 
 function completeDemoTask(path: string, task: JsonObject, workspace: string, attemptDir: string): JsonObject {
@@ -972,7 +1009,7 @@ async function prepareReviewContext(
 
   const repo = String(task.repository);
   const pr = (await githubRequest("GET", `https://api.github.com/repos/${repo}/pulls/${prNumber}`, token)) as JsonObject;
-  const files = (await githubRequest("GET", `https://api.github.com/repos/${repo}/pulls/${prNumber}/files?per_page=100`, token)) as JsonObject[];
+  const files = await githubRequestAllPages(`https://api.github.com/repos/${repo}/pulls/${prNumber}/files`, token);
 
   const fetch = runCommand(["git", "fetch", "--depth", "1", "origin", `pull/${prNumber}/head`], workspace, env, 180);
   writeJsonAtomic(join(attemptDir, "fetch-pr.json"), redactedCommandResult(fetch));
@@ -1024,12 +1061,14 @@ function summarizePr(pr: JsonObject): JsonObject {
     head_ref: head.ref,
     head_sha: head.sha,
     merge_commit_sha: pr.merge_commit_sha,
+    changed_files: pr.changed_files,
   };
 }
 
 function summarizePrFiles(files: JsonObject[]): JsonObject[] {
   return (files || []).map((item) => {
     const patch = String(item.patch || "");
+    const patchTruncated = patchEvidenceIncomplete(patch, Number(item.additions || 0), Number(item.deletions || 0));
     return {
       filename: item.filename,
       status: item.status,
@@ -1038,9 +1077,25 @@ function summarizePrFiles(files: JsonObject[]): JsonObject[] {
       changes: item.changes,
       sha: item.sha,
       patch: patch.slice(0, 12000),
-      patch_truncated: patch.length > 12000,
+      patch_truncated: patch.length > 12000 || patchTruncated,
     };
   });
+}
+
+export function patchEvidenceIncomplete(patch: string, expectedAdditions: number, expectedDeletions: number): boolean {
+  let additions = 0;
+  let deletions = 0;
+  let inHunk = false;
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk || line.startsWith("\\")) continue;
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  return additions !== expectedAdditions || deletions !== expectedDeletions;
 }
 
 function reviewEvidence(reviewContext: JsonObject, reviewContextPath: string, task: JsonObject): JsonObject {
@@ -1055,31 +1110,45 @@ function reviewEvidence(reviewContext: JsonObject, reviewContextPath: string, ta
     head_sha: metadata.head_sha,
     workspace_head_sha: checkout.workspace_head_sha,
     changed_file_count: files.length,
+    expected_changed_file_count: metadata.changed_files,
     changed_files: files.map((file) => file.filename).filter((file): file is JsonValue => file !== undefined),
-    changed_file_lines: files.map((file) => ({path: file.filename, right_lines: patchRightLines(String(file.patch || ""))})),
+    changed_file_lines: files.map((file) => ({path: file.filename, ...patchDiffLines(String(file.patch || ""))})),
+    incomplete_patch_files: files
+      .filter((file) => file.patch_truncated === true || !String(file.patch || "").trim())
+      .map((file) => file.filename)
+      .filter((file): file is JsonValue => file !== undefined),
     review_context_path: reviewContextPath,
     review_context_sha256: fileSha256(reviewContextPath),
   };
 }
 
-function patchRightLines(patch: string): number[] {
-  const lines: number[] = [];
+function patchDiffLines(patch: string): JsonObject {
+  const leftLines: number[] = [];
+  const rightLines: number[] = [];
+  let leftLine: number | null = null;
   let rightLine: number | null = null;
   for (const line of patch.split("\n")) {
-    const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
     if (hunk) {
-      rightLine = Number(hunk[1]);
+      leftLine = Number(hunk[1]);
+      rightLine = Number(hunk[2]);
       continue;
     }
-    if (rightLine === null || line.startsWith("\\")) continue;
+    if (leftLine === null || rightLine === null || line.startsWith("\\")) continue;
     if (line.startsWith("+")) {
-      lines.push(rightLine);
+      rightLines.push(rightLine);
       rightLine += 1;
-    } else if (!line.startsWith("-")) {
+    } else if (line.startsWith("-")) {
+      leftLines.push(leftLine);
+      leftLine += 1;
+    } else {
+      leftLines.push(leftLine);
+      rightLines.push(rightLine);
+      leftLine += 1;
       rightLine += 1;
     }
   }
-  return lines;
+  return {left_lines: leftLines, right_lines: rightLines};
 }
 
 function fileSha256(path: string): string {
@@ -1098,6 +1167,63 @@ function publicationRecordPath(config: AdapterConfig, repo: string, prNumber: nu
   return join(config.publicationsDir, `${sha256(`${repo}#${prNumber}`).slice(0, 24)}.json`);
 }
 
+interface PublicationLock {
+  path: string;
+  owner: string;
+  heartbeat: NodeJS.Timeout;
+}
+
+async function acquirePublicationLock(config: AdapterConfig, key: string): Promise<PublicationLock> {
+  const path = join(config.publicationsDir, `${sha256(key).slice(0, 24)}.lock`);
+  const owner = randomUUID();
+  while (true) {
+    try {
+      mkdirSync(path);
+      const ownerPath = join(path, "owner");
+      writeFileSync(ownerPath, owner, "utf8");
+      const heartbeat = setInterval(() => {
+        try {
+          if (readFileSync(ownerPath, "utf8") === owner) writeFileSync(ownerPath, owner, "utf8");
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, 10_000);
+      heartbeat.unref();
+      return {path, owner, heartbeat};
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const ownerPath = join(path, "owner");
+        const leaseMtime = existsSync(ownerPath) ? statSync(ownerPath).mtimeMs : statSync(path).mtimeMs;
+        if (Date.now() - leaseMtime > 2 * 60 * 1000) {
+          const stalePath = `${path}.stale-${owner}`;
+          renameSync(path, stalePath);
+          rmSync(stalePath, {recursive: true, force: true});
+          continue;
+        }
+      } catch (retryError) {
+        if ((retryError as NodeJS.ErrnoException).code !== "ENOENT") {
+          if ((retryError as NodeJS.ErrnoException).code !== "EEXIST") throw retryError;
+        }
+        continue;
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
+  }
+}
+
+function releasePublicationLock(lock: PublicationLock): void {
+  clearInterval(lock.heartbeat);
+  try {
+    if (readFileSync(join(lock.path, "owner"), "utf8") !== lock.owner) return;
+    const releasePath = `${lock.path}.release-${lock.owner}`;
+    renameSync(lock.path, releasePath);
+    rmSync(releasePath, {recursive: true, force: true});
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
 function publicationIdentity(task: JsonObject, result: JsonObject): string {
   const evidence = (task.review_evidence as JsonObject | undefined) || {};
   return sha256(stableCompactStringify({
@@ -1107,77 +1233,497 @@ function publicationIdentity(task: JsonObject, result: JsonObject): string {
   }));
 }
 
+interface PublicationTrust {
+  secret: string;
+  target: string;
+  botUsernames: Set<string>;
+}
+
+function publicationTrust(config: AdapterConfig, task: JsonObject, target: string): PublicationTrust {
+  if (!config.webhookSecret) throw new Error("GITHUB_WEBHOOK_SECRET is required to sign publication identities");
+  const policy = (task.policy_snapshot as JsonObject | undefined) || {};
+  return {
+    secret: config.webhookSecret,
+    target,
+    botUsernames: new Set((Array.isArray(policy.bot_usernames) ? policy.bot_usernames : []).map((name) => String(name).toLowerCase())),
+  };
+}
+
+function markerCreatedAt(taskCreatedAt?: JsonValue): string {
+  return typeof taskCreatedAt === "string" && Number.isFinite(Date.parse(taskCreatedAt)) ? taskCreatedAt : "";
+}
+
+function publicationProof(trust: PublicationTrust, identity: string, createdAt: string): string {
+  return createHmac("sha256", trust.secret).update(`${trust.target}\0${identity}\0${createdAt}`).digest("hex");
+}
+
+function publicationMarker(trust: PublicationTrust, identity: string, taskCreatedAt?: JsonValue): string {
+  const createdAt = markerCreatedAt(taskCreatedAt);
+  return [
+    `<!-- covencat-publication:${identity} -->`,
+    createdAt ? `<!-- covencat-task-created:${createdAt} -->` : "",
+    `<!-- covencat-publication-proof:${publicationProof(trust, identity, createdAt)} -->`,
+  ].filter(Boolean).join("\n");
+}
+
+function publicationIdentityFromBody(item: JsonObject): string {
+  return String(item.body || "").match(/<!-- covencat-publication:([a-f0-9]{64}) -->/)?.[1] || "";
+}
+
+function trustedPublication(item: JsonObject, trust: PublicationTrust): boolean {
+  const body = String(item.body || "");
+  const identity = publicationIdentityFromBody(item);
+  const createdAt = body.match(/<!-- covencat-task-created:([^>]+) -->/)?.[1] || "";
+  const proof = body.match(/<!-- covencat-publication-proof:([a-f0-9]{64}) -->/)?.[1] || "";
+  const user = (item.user as JsonObject | undefined) || {};
+  const login = String(user.login || "").toLowerCase();
+  if (!identity || !proof || user.type !== "Bot" || (trust.botUsernames.size && !trust.botUsernames.has(login))) return false;
+  const actual = Buffer.from(proof, "hex");
+  const expected = Buffer.from(publicationProof(trust, identity, createdAt), "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function trustedPublications(items: JsonObject[], trust: PublicationTrust): JsonObject[] {
+  return items.filter((item) => trustedPublication(item, trust));
+}
+
+function publicationWithIdentity(items: JsonObject[], identity: string, trust: PublicationTrust): JsonObject | undefined {
+  return latestCovencatPublication(trustedPublications(items, trust).filter((item) => publicationIdentityFromBody(item) === identity));
+}
+
+function latestCovencatPublication(items: JsonObject[]): JsonObject | undefined {
+  return items.reduce<JsonObject | undefined>((latest, item) => !latest || publicationGeneration(item) >= publicationGeneration(latest) ? item : latest, undefined);
+}
+
+function publicationGeneration(item: JsonObject): number {
+  const bodyCreatedAt = String(item.body || "").match(/<!-- covencat-task-created:([^>]+) -->/)?.[1];
+  const created = Date.parse(bodyCreatedAt || String(item.submitted_at || item.published_at || ""));
+  return Number.isFinite(created) ? created : Number(item.id || 0);
+}
+
+function previousCovencatPublication(items: JsonObject[], identity: string, trust: PublicationTrust): JsonObject | undefined {
+  return latestCovencatPublication(trustedPublications(items, trust).filter((item) => {
+    const itemIdentity = publicationIdentityFromBody(item);
+    return itemIdentity && itemIdentity !== identity;
+  }));
+}
+
+function clearPublicationError(task: JsonObject): void {
+  delete task.publication_error;
+}
+
+function inlineLocationError(error: unknown): boolean {
+  return error instanceof GithubApiError && error.status === 422 && /(comment|diff|line|position|pullrequestreviewcomment)/i.test(error.responseBody);
+}
+
+function selfReviewError(error: unknown): boolean {
+  return error instanceof GithubApiError && error.status === 422 && /(?:approve|request changes?).{0,40}(?:own|your) pull request|own pull request.{0,40}(?:approve|request changes?)/i.test(error.responseBody);
+}
+
+function safePublicationText(value: string, maxLength = 60_000): string {
+  return redactTokenish(value).slice(0, maxLength);
+}
+
+function decisiveReviewState(value: JsonValue | undefined): boolean {
+  return ["APPROVE", "APPROVED", "REQUEST_CHANGES", "CHANGES_REQUESTED"].includes(String(value || "").toUpperCase());
+}
+
+function priorReviewFromRecord(record: JsonObject): JsonObject {
+  return {
+    id: record.previous_review_id,
+    state: record.previous_decision,
+    html_url: record.previous_review_url,
+    identity: record.previous_identity,
+  };
+}
+
+function publicationRecord(
+  task: JsonObject,
+  identity: string,
+  review: JsonObject,
+  decision: JsonValue | undefined,
+  previous: JsonObject,
+  pendingDismissals: JsonObject[],
+  submissionPending = false,
+): JsonObject {
+  return {
+    identity,
+    review_id: review.id,
+    review_url: review.html_url,
+    decision,
+    task_id: task.task_id,
+    task_created_at: task.created_at,
+    head_sha: ((task.review_evidence as JsonObject | undefined) || {}).head_sha,
+    published_at: review.submitted_at || utcNow(),
+    previous_identity: previous.identity || publicationIdentityFromBody(previous),
+    previous_review_id: previous.review_id || previous.id,
+    previous_review_url: previous.review_url || previous.html_url,
+    previous_decision: previous.decision || previous.state,
+    supersession_pending: pendingDismissals.length > 0,
+    pending_dismissals: pendingDismissals,
+    submission_pending: submissionPending,
+    desired_decision: submissionPending ? decision : undefined,
+    review_body: submissionPending ? review.body : undefined,
+  };
+}
+
+function reviewReference(review: JsonObject): JsonObject {
+  return {
+    id: review.review_id || review.id,
+    state: review.decision || review.state,
+    html_url: review.review_url || review.html_url,
+    identity: review.identity || publicationIdentityFromBody(review),
+  };
+}
+
+function pendingDismissalsFromRecord(record: JsonObject): JsonObject[] {
+  const pending = Array.isArray(record.pending_dismissals)
+    ? record.pending_dismissals.filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+  if (!pending.length && record.supersession_pending === true) {
+    const legacy = priorReviewFromRecord(record);
+    if (legacy.id) pending.push(legacy);
+  }
+  return pending;
+}
+
+function priorDecisiveReviews(items: JsonObject[], identity: string, trust: PublicationTrust, record: JsonObject): JsonObject[] {
+  const candidates = [
+    ...trustedPublications(items, trust).filter((item) => decisiveReviewState(item.state)),
+    ...(record.identity && record.identity !== identity && decisiveReviewState(record.decision) ? [record] : []),
+    ...pendingDismissalsFromRecord(record),
+  ];
+  const unique = new Map<number, JsonObject>();
+  for (const candidate of candidates) {
+    const reference = reviewReference(candidate);
+    const id = Number(reference.id || 0);
+    if (id && decisiveReviewState(reference.state)) unique.set(id, reference);
+  }
+  return [...unique.values()];
+}
+
+async function reconcilePriorDecisiveReviews(
+  repo: string,
+  prNumber: number,
+  token: string,
+  previousReviews: JsonObject[],
+  current: JsonObject,
+  task: JsonObject,
+): Promise<JsonObject[]> {
+  const currentReviewId = Number(current.review_id || current.id || 0);
+  const pending: JsonObject[] = [];
+  const errors: string[] = [];
+  let attempted = 0;
+  for (const previous of previousReviews) {
+    const previousReviewId = Number(previous.review_id || previous.id || 0);
+    const previousState = previous.decision || previous.state;
+    if (!previousReviewId || previousReviewId === currentReviewId || !decisiveReviewState(previousState)) continue;
+    attempted += 1;
+    try {
+      await githubRequest("PUT", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${previousReviewId}/dismissals`, token, {
+        message: `Superseded by ${String(current.review_url || current.html_url || "a newer covencat review")}`,
+        event: "DISMISS",
+      });
+    } catch (error) {
+      pending.push(reviewReference(previous));
+      errors.push(redactTokenish(String((error as Error).stack || error)));
+    }
+  }
+  if (!attempted) {
+    delete task.publication_supersession_state;
+    delete task.publication_supersession_error;
+    return [];
+  }
+  if (!pending.length) {
+    task.publication_supersession_state = "prior_decisive_review_dismissed";
+    delete task.publication_supersession_error;
+    return [];
+  }
+  task.publication_supersession_state = "prior_decisive_review_dismissal_failed";
+  task.publication_supersession_error = errors.join("\n");
+  if (pending.length) {
+    const currentBody = String(current.body || "");
+    const warning = "_Warning: GitHub did not permit covencat to dismiss the prior decisive review; maintainers should dismiss it manually._";
+    if (currentReviewId && currentBody && !currentBody.includes(warning)) {
+      try {
+        await githubRequest("PUT", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${currentReviewId}`, token, {
+          body: safePublicationText(`${currentBody}\n\n${warning}`),
+        });
+      } catch (updateError) {
+        task.publication_supersession_error = redactTokenish(`${task.publication_supersession_error}\n${String((updateError as Error).stack || updateError)}`);
+      }
+    }
+  }
+  return pending;
+}
+
+async function reconcileReplacementSupersession(
+  repo: string,
+  prNumber: number,
+  token: string,
+  priorReviews: JsonObject[],
+  submitted: SubmittedReview,
+  evidenceComplete: boolean,
+  task: JsonObject,
+): Promise<JsonObject[]> {
+  if (submitted.staleEvidence || !evidenceComplete) {
+    if (priorReviews.length) {
+      task.publication_supersession_state = submitted.staleEvidence
+        ? "prior_decisive_review_retained_for_stale_replacement"
+        : "prior_decisive_review_retained_for_incomplete_replacement";
+      delete task.publication_supersession_error;
+    }
+    return priorReviews;
+  }
+  return reconcilePriorDecisiveReviews(repo, prNumber, token, priorReviews, submitted.review, task);
+}
+
+interface SubmittedReview {
+  review: JsonObject;
+  body: string;
+  decision: string;
+  staleAfterSubmit: boolean;
+  staleEvidence: boolean;
+}
+
+async function currentPullHead(repo: string, prNumber: number, token: string): Promise<string> {
+  const pr = (await githubRequest("GET", `https://api.github.com/repos/${repo}/pulls/${prNumber}`, token)) as JsonObject;
+  return String(((pr.head as JsonObject | undefined) || {}).sha || "");
+}
+
+async function dismissReviewForStaleHead(
+  repo: string,
+  prNumber: number,
+  token: string,
+  review: JsonObject,
+  body: string,
+): Promise<SubmittedReview> {
+  const reviewId = Number(review.id || review.review_id || 0);
+  if (!reviewId) throw new Error("GitHub did not return an ID for the stale decisive review");
+  await githubRequest("PUT", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/dismissals`, token, {
+    message: "Dismissed automatically because the PR head changed while covencat was submitting the review.",
+    event: "DISMISS",
+  });
+  const publishedBody = safePublicationText(`${body}\n\n_This decisive review was dismissed automatically because the PR head changed during submission._`);
+  await githubRequest("PUT", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}`, token, {body: publishedBody});
+  return {review: {...review, state: "DISMISSED", body: publishedBody}, body: publishedBody, decision: "DISMISSED", staleAfterSubmit: true, staleEvidence: true};
+}
+
+async function submitPendingReview(
+  repo: string,
+  prNumber: number,
+  token: string,
+  pendingReview: JsonObject,
+  desiredDecision: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  evidenceHead: string,
+  body: string,
+): Promise<SubmittedReview> {
+  const reviewId = Number(pendingReview.id || pendingReview.review_id || 0);
+  if (!reviewId) throw new Error("GitHub did not return an ID for the pending review");
+  let decision: "APPROVE" | "REQUEST_CHANGES" | "COMMENT" = desiredDecision;
+  let publishedBody = body;
+  let staleEvidence = false;
+  const headBeforeSubmit = await currentPullHead(repo, prNumber, token);
+  if (headBeforeSubmit !== evidenceHead && decisiveReviewState(decision)) {
+    staleEvidence = true;
+    decision = "COMMENT";
+    publishedBody = safePublicationText(`${body}\n\n_The PR head changed before this review was submitted, so stale evidence was published as COMMENT._`);
+  }
+  let response: JsonObject;
+  try {
+    response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/events`, token, {
+      event: decision,
+      body: publishedBody,
+    })) as JsonObject;
+  } catch (error) {
+    if (!selfReviewError(error) || !decisiveReviewState(decision)) throw error;
+    decision = "COMMENT";
+    publishedBody = safePublicationText(`${body}\n\n_GitHub does not allow the App to submit a decisive review on its own pull request, so this was published as COMMENT._`);
+    response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${reviewId}/events`, token, {
+      event: decision,
+      body: publishedBody,
+    })) as JsonObject;
+  }
+  let review: JsonObject = {...pendingReview, ...response, id: response.id || pendingReview.id, body: publishedBody};
+  if (decisiveReviewState(decision)) {
+    const headAfterSubmit = await currentPullHead(repo, prNumber, token);
+    if (headAfterSubmit !== evidenceHead) {
+      return dismissReviewForStaleHead(repo, prNumber, token, review, publishedBody);
+    }
+  }
+  return {review, body: publishedBody, decision, staleAfterSubmit: false, staleEvidence};
+}
+
 function repositoryPath(value: JsonValue | undefined): string | null {
-  const path = String(value || "").trim();
-  if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").some((part) => !part || part === "." || part === "..")) {
+  if (typeof value !== "string") return null;
+  const path = value.trim();
+  if (!path || path.includes("\n") || path.includes("\r") || /^\d+:\s/.test(path) || path.startsWith("/") || path.includes("\\") || path.split("/").some((part) => !part || part === "." || part === "..")) {
     return null;
   }
   return path;
+}
+
+function repositoryPathExists(root: string | undefined, path: string): boolean {
+  if (!root) return true;
+  const normalizedRoot = resolve(root);
+  const candidate = resolve(normalizedRoot, path);
+  return candidate.startsWith(`${normalizedRoot}${sep}`) && existsSync(candidate);
 }
 
 function actionableFinding(finding: JsonObject): boolean {
   return !["info", "informational", "nit", "note"].includes(String(finding.severity || "").toLowerCase()) && Boolean(finding.title || finding.body || finding.recommendation);
 }
 
-export function normalizeReviewPublication(task: JsonObject, result: JsonObject): NormalizedReviewPublication {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function validFinding(finding: JsonObject): boolean {
+  const allowed = new Set(["info", "low", "medium", "high", "critical"]);
+  const line = finding.line;
+  return allowed.has(String(finding.severity || ""))
+    && typeof finding.file === "string"
+    && (line === null || (typeof line === "number" && Number.isInteger(line) && line >= 1))
+    && typeof finding.title === "string"
+    && typeof finding.body === "string"
+    && (finding.recommendation === null || typeof finding.recommendation === "string");
+}
+
+export function normalizeReviewPublication(task: JsonObject, result: JsonObject, currentHeadSha?: string, repositoryRoot?: string): NormalizedReviewPublication {
   const review = {...((result.review as JsonObject | undefined) || {})};
   const evidence = (task.review_evidence as JsonObject | undefined) || {};
   const changedFiles = new Set((Array.isArray(evidence.changed_files) ? evidence.changed_files : [])
     .map((path) => repositoryPath(path))
     .filter((path): path is string => path !== null));
-  const changedLines = new Map<string, Set<number>>();
+  const changedLines = new Map<string, {LEFT: Set<number>; RIGHT: Set<number>}>();
   for (const item of (Array.isArray(evidence.changed_file_lines) ? evidence.changed_file_lines : [])) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const file = repositoryPath((item as JsonObject).path);
-    const lines = (item as JsonObject).right_lines;
-    if (file && Array.isArray(lines)) changedLines.set(file, new Set(lines.map(Number).filter((line) => Number.isInteger(line) && line > 0)));
+    const left = (item as JsonObject).left_lines;
+    const right = (item as JsonObject).right_lines;
+    if (file) {
+      changedLines.set(file, {
+        LEFT: new Set((Array.isArray(left) ? left : []).map(Number).filter((line) => Number.isInteger(line) && line > 0)),
+        RIGHT: new Set((Array.isArray(right) ? right : []).map(Number).filter((line) => Number.isInteger(line) && line > 0)),
+      });
+    }
   }
   const validationIssues: string[] = [];
+  if (String(result.contract_version || "") !== "2") validationIssues.push("result contract_version is not v2");
+  if (!["success", "failure", "partial", "needs_input"].includes(String(result.status || ""))) validationIssues.push("result status is invalid");
+  if (typeof result.summary !== "string" || typeof result.pr_body !== "string") validationIssues.push("result summary or pr_body is invalid");
+  if (!Array.isArray(result.commits) || !Array.isArray(result.files_changed)) validationIssues.push("result commits or files_changed is invalid");
+  for (const field of ["reviewed_files", "supporting_files", "findings", "tests_run", "limitations"]) {
+    if (!Array.isArray(review[field])) validationIssues.push(`review.${field} is missing or invalid`);
+  }
+  if (!["none", "pull_request", "review_comment"].includes(String(review.mode || ""))) validationIssues.push("review mode is invalid");
+  if (!["not_applicable", "complete", "partial", "missing"].includes(String(review.evidence_status || ""))) validationIssues.push("review evidence_status is invalid");
+  if (!("no_findings_reason" in review) || (review.no_findings_reason !== null && typeof review.no_findings_reason !== "string")) validationIssues.push("review no_findings_reason is missing or invalid");
   const reviewedFiles = (Array.isArray(review.reviewed_files) ? review.reviewed_files : [])
     .map((path) => repositoryPath(path));
-  const suppliedInspected = (Array.isArray(result.files_inspected) ? result.files_inspected : [])
+  const supportingFiles = (Array.isArray(review.supporting_files) ? review.supporting_files : [])
+    .map((path) => repositoryPath(path));
+  const suppliedInspectedPresent = Array.isArray(result.files_inspected);
+  const suppliedInspected = (suppliedInspectedPresent ? result.files_inspected as JsonValue[] : [])
     .map((path) => repositoryPath(path));
   const validReviewedFiles = reviewedFiles.filter((path): path is string => path !== null && changedFiles.has(path));
   const invalidReviewedFiles = reviewedFiles.filter((path) => path === null || !changedFiles.has(path));
+  const reviewedFileSet = new Set(validReviewedFiles);
   if (review.mode !== "pull_request") validationIssues.push("result did not declare pull_request review mode");
   if (review.evidence_status !== "complete") validationIssues.push("review evidence was not marked complete");
+  if (result.status !== "success") validationIssues.push("runtime result was not successful");
   if (!String(evidence.head_sha || "").trim()) validationIssues.push("PR head revision is missing");
+  if (!String(evidence.workspace_head_sha || "").trim()) validationIssues.push("checked-out revision is missing");
+  if (evidence.workspace_head_sha !== evidence.head_sha) validationIssues.push("checked-out revision does not match the captured PR head");
+  if (!String(evidence.publication_workspace_head_sha || "").trim()) validationIssues.push("post-run workspace revision is missing");
+  if (evidence.publication_workspace_head_sha !== evidence.head_sha) validationIssues.push("post-run workspace revision does not match the captured PR head");
+  if (evidence.publication_workspace_clean !== true) validationIssues.push("post-run workspace contains uncommitted changes");
+  if (currentHeadSha !== undefined && !currentHeadSha) validationIssues.push("current PR head could not be verified");
+  if (currentHeadSha && currentHeadSha !== evidence.head_sha) validationIssues.push("PR head changed after review evidence was captured");
   if (!changedFiles.size) validationIssues.push("no changed-file evidence was captured");
+  if (Number(evidence.changed_file_count) !== changedFiles.size) validationIssues.push("changed-file count does not match captured changed files");
+  if (Number(evidence.expected_changed_file_count) !== changedFiles.size) validationIssues.push("captured files do not cover the PR changed-file count");
+  if (!Array.isArray(evidence.incomplete_patch_files)) validationIssues.push("diff evidence completeness is missing");
+  if (Array.isArray(evidence.incomplete_patch_files) && evidence.incomplete_patch_files.length) validationIssues.push("captured diff evidence is incomplete or truncated");
   if (!reviewedFiles.length) validationIssues.push("no reviewed files were reported");
   if (invalidReviewedFiles.length) validationIssues.push("reviewed files are not all changed files in the captured PR revision");
-  if (suppliedInspected.some((path) => path === null || !changedFiles.has(path))) validationIssues.push("files_inspected contains paths outside the captured PR diff");
-  if (suppliedInspected.length && suppliedInspected.filter((path): path is string => path !== null).some((path) => !validReviewedFiles.includes(path))) {
-    validationIssues.push("files_inspected and reviewed_files disagree");
+  if ([...changedFiles].some((path) => !reviewedFileSet.has(path))) validationIssues.push("review scope does not cover every changed file");
+  const verifiedEvidencePath = (path: string): boolean => changedFiles.has(path) || repositoryPathExists(repositoryRoot, path);
+  if (suppliedInspected.some((path) => path === null || (path !== null && !verifiedEvidencePath(path)))) validationIssues.push("files_inspected contains an invalid or missing repository path");
+  const suppliedInspectedSet = new Set(suppliedInspected.filter((path): path is string => path !== null));
+  const validSupportingFiles = supportingFiles.filter((path): path is string => path !== null && repositoryPathExists(repositoryRoot, path));
+  const expectedInspectedSet = new Set([...reviewedFileSet, ...validSupportingFiles]);
+  if (suppliedInspectedPresent && ([...suppliedInspectedSet].some((path) => !expectedInspectedSet.has(path)) || [...expectedInspectedSet].some((path) => !suppliedInspectedSet.has(path)))) {
+    validationIssues.push("files_inspected does not match reviewed_files plus supporting_files");
   }
+  if (supportingFiles.some((path) => path === null || (path !== null && !repositoryPathExists(repositoryRoot, path)))) validationIssues.push("supporting_files contains an invalid or missing repository path");
+  const limitations = Array.isArray(review.limitations) ? review.limitations.filter((item) => String(item || "").trim()) : [];
+  if (Array.isArray(review.limitations) && review.limitations.some((item) => typeof item !== "string")) validationIssues.push("review limitations contains an invalid entry");
+  if (limitations.length) validationIssues.push("review reported limitations");
 
-  const testsRun = Array.isArray(review.tests_run) ? (review.tests_run as JsonObject[]) : [];
+  const testsRun = (Array.isArray(review.tests_run) ? review.tests_run : [])
+    .filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  if (Array.isArray(review.tests_run) && testsRun.length !== review.tests_run.length) validationIssues.push("tests_run contains an invalid entry");
+  if (!testsRun.length) validationIssues.push("no test execution evidence was reported");
+  const normalizedTests: JsonObject[] = [];
   for (const test of testsRun) {
     const command = String(test.command || "").trim();
     const status = String(test.status || "").toLowerCase();
     const output = String(test.output_summary || "").trim();
     const narrative = `${String(result.summary || "")}\n${String(result.pr_body || "")}`.toLowerCase();
-    if (status === "passed" && (!command || !output || output.toLowerCase().includes("not run") || narrative.includes(`${command.toLowerCase()} - not run`))) {
+    const validShape = typeof test.command === "string"
+      && ["passed", "failed", "not_run", "unknown"].includes(status)
+      && (test.output_summary === null || typeof test.output_summary === "string");
+    if (!validShape) validationIssues.push(`test evidence for ${command || "an unnamed command"} is malformed`);
+    const narrativeDeniesExecution = /\b(?:tests?|checks?|commands?)\b.{0,50}\b(?:not (?:run|executed)|skip(?:ped)?|unable to (?:run|execute))\b/i.test(narrative)
+      || /\b(?:not (?:run|executed)|skip(?:ped)?|unable to (?:run|execute))\b.{0,50}\b(?:tests?|checks?|commands?)\b/i.test(narrative);
+    const commandDenied = command && new RegExp(`${escapeRegExp(command.toLowerCase())}.{0,30}(?:not (?:run|executed)|skip(?:ped)?|unable)`, "i").test(narrative);
+    const invalidPass = status === "passed" && (!validShape || !command || !output || /\b(not[ _-]?run|skip(?:ped)?)\b/i.test(output) || narrativeDeniesExecution || commandDenied);
+    if (invalidPass) {
       validationIssues.push(`test evidence for ${command || "an unnamed command"} is contradictory or incomplete`);
+      normalizedTests.push({...test, status: "unverified", output_summary: "Reported as passed, but supporting execution evidence was missing or contradictory."});
+    } else {
+      normalizedTests.push({...test, command: command || "unknown command", status: status || "unknown", output_summary: output});
+      if (status !== "passed") validationIssues.push(`test ${command || "an unnamed command"} did not pass`);
     }
   }
 
-  const findings = Array.isArray(review.findings) ? (review.findings as JsonObject[]) : [];
+  const findings = (Array.isArray(review.findings) ? review.findings : [])
+    .filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  if (Array.isArray(review.findings) && findings.length !== review.findings.length) validationIssues.push("findings contains an invalid entry");
+  const validFindings = findings.filter(validFinding);
+  if (validFindings.length !== findings.length) validationIssues.push("findings contains a malformed finding");
+  if (findings.length && review.no_findings_reason !== null) validationIssues.push("a no-findings reason was reported alongside findings");
+  const scopedFindings = validFindings.filter((finding) => {
+    const path = repositoryPath(finding.file);
+    return Boolean(path && changedFiles.has(path));
+  });
+  if (scopedFindings.length !== validFindings.length) validationIssues.push("findings contains a path outside the verified changed-file set");
   const inlineComments: JsonObject[] = [];
-  for (const finding of findings) {
+  for (const finding of scopedFindings) {
     const path = repositoryPath(finding.file);
     const line = Number(finding.line);
-    if (path && changedFiles.has(path) && changedLines.get(path)?.has(line) && Number.isInteger(line) && line > 0 && actionableFinding(finding)) {
+    const locations = path ? changedLines.get(path) : undefined;
+    const side = locations?.RIGHT.has(line) ? "RIGHT" : locations?.LEFT.has(line) ? "LEFT" : null;
+    if (path && side && changedFiles.has(path) && Number.isInteger(line) && line > 0 && actionableFinding(finding)) {
       inlineComments.push({
         path,
         line,
-        side: String(finding.side || "RIGHT").toUpperCase() === "LEFT" ? "LEFT" : "RIGHT",
+        side,
         body: findingCommentBody(finding),
       });
     }
   }
 
+  if (!findings.length && !String(review.no_findings_reason || "").trim()) validationIssues.push("no-findings review is missing its justification");
   const evidenceComplete = validationIssues.length === 0;
-  const actionable = findings.some(actionableFinding);
+  const actionable = scopedFindings.some(actionableFinding);
+  review.evidence_status = evidenceComplete ? "complete" : "partial";
+  review.reviewed_files = validReviewedFiles;
+  review.supporting_files = validSupportingFiles;
+  review.findings = findings;
+  review.tests_run = normalizedTests;
+  review.limitations = limitations;
   return {
     review,
     decision: evidenceComplete && !findings.length ? "APPROVE" : evidenceComplete && actionable ? "REQUEST_CHANGES" : "COMMENT",
@@ -1191,7 +1737,7 @@ function findingCommentBody(finding: JsonObject): string {
   const parts = [`**${String(finding.severity || "finding")}**: ${String(finding.title || "Untitled finding")}`];
   if (finding.body) parts.push("", String(finding.body));
   if (finding.recommendation) parts.push("", `Suggested resolution: ${String(finding.recommendation)}`);
-  return parts.join("\n").slice(0, 6000);
+  return safePublicationText(parts.join("\n"), 6000);
 }
 
 export async function publishResultIfConfigured(config: AdapterConfig, task: JsonObject, resultPath: string, token: string): Promise<void> {
@@ -1213,55 +1759,198 @@ export async function publishResultIfConfigured(config: AdapterConfig, task: Jso
 
   const repo = String(task.repository);
   const identity = publicationIdentity(task, result);
+  const publicationLock = await acquirePublicationLock(config, `${repo}#${prNumber ? `pr:${prNumber}` : `issue:${number}`}`);
   try {
-    if (prNumber && Object.keys((result.review as JsonObject | undefined) || {}).length) {
-      if (task.publication_identity === identity && task.publication_review_id) {
-        task.publication_state = "publication_skipped_duplicate";
+    try {
+      const hasReview = Object.keys((result.review as JsonObject | undefined) || {}).length > 0;
+      const operationalFailure = ["failure", "needs_input"].includes(String(result.status || "")) && !hasReview;
+      if (prNumber && !operationalFailure) {
+        if (task.publication_identity === identity && task.publication_review_id && task.publication_supersession_state !== "prior_decisive_review_dismissal_failed") {
+          task.publication_state = "publication_skipped_duplicate";
+          clearPublicationError(task);
+          return;
+        }
+        const recordPath = publicationRecordPath(config, repo, prNumber);
+        const stored = readJson<JsonObject>(recordPath, {});
+        if (stored.identity === identity && stored.review_id && stored.supersession_pending !== true && stored.submission_pending !== true) {
+          task.publication_state = "publication_skipped_duplicate";
+          task.publication_identity = identity;
+          task.publication_review_id = stored.review_id;
+          task.publication_url = stored.review_url;
+          clearPublicationError(task);
+          return;
+        }
+
+        const target = `${repo}#pr:${prNumber}`;
+        const trust = publicationTrust(config, task, target);
+        const currentHeadSha = await currentPullHead(repo, prNumber, token);
+        const reviews = await githubRequestAllPages(`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token);
+        const trustedReviews = trustedPublications(reviews, trust);
+        const evidence = (task.review_evidence as JsonObject | undefined) || {};
+        const currentHeadRemote = latestCovencatPublication(trustedReviews.filter((review) => String(review.commit_id || "") === currentHeadSha));
+        const evidenceHeadRemote = latestCovencatPublication(trustedReviews.filter((review) => String(review.commit_id || "") === String(evidence.head_sha || ""))) || {};
+        const evidenceHeadRemoteIdentity = publicationIdentityFromBody(evidenceHeadRemote);
+        const taskGeneration = Date.parse(String(task.created_at || ""));
+        const staleRevision = evidence.head_sha !== currentHeadSha
+          && (Boolean(currentHeadRemote) || String(stored.head_sha || "") === currentHeadSha);
+        const staleGeneration = evidenceHeadRemoteIdentity
+          && evidenceHeadRemoteIdentity !== identity
+          && Number.isFinite(taskGeneration)
+          && publicationGeneration(evidenceHeadRemote) > taskGeneration;
+        const existing = publicationWithIdentity(reviews, identity, trust);
+        if (staleRevision || staleGeneration) {
+          if (existing && String(existing.state || "").toUpperCase() === "PENDING") {
+            await githubRequest("DELETE", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${Number(existing.id)}`, token);
+          } else if (existing && staleRevision && decisiveReviewState(existing.state)) {
+            await dismissReviewForStaleHead(repo, prNumber, token, existing, String(existing.body || ""));
+          }
+          task.publication_state = staleRevision ? "publication_skipped_stale_revision" : "publication_skipped_stale_run";
+          task.publication_identity = identity;
+          clearPublicationError(task);
+          return;
+        }
+
+        if (existing && evidenceHeadRemoteIdentity && evidenceHeadRemoteIdentity !== identity && publicationGeneration(evidenceHeadRemote) >= publicationGeneration(existing)) {
+          if (String(existing.state || "").toUpperCase() === "PENDING") {
+            await githubRequest("DELETE", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${Number(existing.id)}`, token);
+          }
+          task.publication_state = "publication_skipped_stale_run";
+          task.publication_identity = identity;
+          clearPublicationError(task);
+          return;
+        }
+        const previous = previousCovencatPublication(reviews, identity, trust)
+          || (stored.identity !== identity ? stored : priorReviewFromRecord(stored));
+        const repositoryRoot = join(config.workspacesDir, String(task.task_id), "repo");
+        const normalized = normalizeReviewPublication(task, result, currentHeadSha, repositoryRoot);
+        const priorDecisive = priorDecisiveReviews(reviews, identity, trust, stored);
+        if (existing) {
+          const recoveredPending = String(existing.state || "").toUpperCase() === "PENDING";
+          let submitted = recoveredPending
+            ? await submitPendingReview(repo, prNumber, token, existing, normalized.decision, String(evidence.head_sha || ""), String(existing.body || ""))
+            : {review: existing, body: String(existing.body || ""), decision: String(existing.state || normalized.decision), staleAfterSubmit: false, staleEvidence: false};
+          if (!recoveredPending && decisiveReviewState(submitted.decision) && currentHeadSha !== evidence.head_sha) {
+            submitted = await dismissReviewForStaleHead(repo, prNumber, token, submitted.review, submitted.body);
+          }
+          const pendingDismissals = await reconcileReplacementSupersession(repo, prNumber, token, priorDecisive, submitted, normalized.evidenceComplete, task);
+          const record = publicationRecord(task, identity, submitted.review, submitted.decision, previous, pendingDismissals);
+          writeJsonAtomic(recordPath, record);
+          task.publication_state = submitted.staleAfterSubmit ? "published_review_dismissed_stale" : submitted.staleEvidence ? "published_review_stale_comment" : recoveredPending ? "published_review_recovered" : "publication_skipped_duplicate";
+          task.publication_identity = identity;
+          task.publication_review_id = submitted.review.id;
+          task.publication_url = submitted.review.html_url;
+          task.publication_decision = submitted.decision;
+          clearPublicationError(task);
+          return;
+        }
+
+        if (stored.identity === identity && stored.review_id) {
+          const current = {
+            id: stored.review_id,
+            review_id: stored.review_id,
+            html_url: stored.review_url,
+            review_url: stored.review_url,
+            body: stored.review_body,
+          };
+          let submitted = stored.submission_pending === true
+            ? await submitPendingReview(repo, prNumber, token, current, normalized.decision, String(evidence.head_sha || ""), String(stored.review_body || ""))
+            : {review: current, body: String(stored.review_body || ""), decision: String(stored.decision || normalized.decision), staleAfterSubmit: false, staleEvidence: false};
+          if (stored.submission_pending !== true && decisiveReviewState(submitted.decision) && currentHeadSha !== evidence.head_sha) {
+            submitted = await dismissReviewForStaleHead(repo, prNumber, token, submitted.review, submitted.body);
+          }
+          const pendingDismissals = await reconcileReplacementSupersession(repo, prNumber, token, priorDecisive, submitted, normalized.evidenceComplete, task);
+          writeJsonAtomic(recordPath, publicationRecord(task, identity, submitted.review, submitted.decision, previous, pendingDismissals));
+          task.publication_state = submitted.staleAfterSubmit ? "published_review_dismissed_stale" : submitted.staleEvidence ? "published_review_stale_comment" : "publication_skipped_duplicate";
+          task.publication_identity = identity;
+          task.publication_review_id = submitted.review.id;
+          task.publication_url = submitted.review.html_url;
+          task.publication_decision = submitted.decision;
+          clearPublicationError(task);
+          return;
+        }
+
+        for (const pending of trustedReviews.filter((review) => String(review.state || "").toUpperCase() === "PENDING")) {
+          await githubRequest("DELETE", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${Number(pending.id)}`, token);
+        }
+        let publishedBody = `${safePublicationText(publicationReviewBody(task, result, normalized, previous, identity), 59_700)}\n\n${publicationMarker(trust, identity, task.created_at)}`;
+        const reviewPayload: JsonObject = {body: publishedBody, commit_id: evidence.head_sha};
+        if (normalized.inlineComments.length) reviewPayload.comments = normalized.inlineComments;
+        let pendingReview: JsonObject;
+        try {
+          pendingReview = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token, reviewPayload)) as JsonObject;
+        } catch (error) {
+          if (!normalized.inlineComments.length || !inlineLocationError(error)) throw error;
+          publishedBody = safePublicationText(`${publishedBody}\n\n_Inline publication was unavailable; findings are included above._`);
+          pendingReview = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token, {
+            body: publishedBody,
+            commit_id: evidence.head_sha,
+          })) as JsonObject;
+        }
+        pendingReview = {...pendingReview, body: publishedBody, state: pendingReview.state || "PENDING"};
+        writeJsonAtomic(recordPath, publicationRecord(task, identity, pendingReview, normalized.decision, previous, priorDecisive, true));
+        const submitted = await submitPendingReview(repo, prNumber, token, pendingReview, normalized.decision, String(evidence.head_sha || ""), publishedBody);
+        task.publication_state = submitted.staleAfterSubmit ? "published_review_dismissed_stale" : submitted.staleEvidence ? "published_review_stale_comment" : "published_review";
+        task.publication_identity = identity;
+        task.publication_review_id = submitted.review.id;
+        task.publication_url = submitted.review.html_url;
+        task.publication_decision = submitted.decision;
+        clearPublicationError(task);
+        const pendingDismissals = await reconcileReplacementSupersession(repo, prNumber, token, priorDecisive, submitted, normalized.evidenceComplete, task);
+        writeJsonAtomic(recordPath, publicationRecord(task, identity, submitted.review, submitted.decision, previous, pendingDismissals));
         return;
       }
-      const recordPath = publicationRecordPath(config, repo, prNumber);
-      const previous = readJson<JsonObject>(recordPath, {});
-      const normalized = normalizeReviewPublication(task, result);
-      const body = publicationReviewBody(task, result, normalized, previous);
-      const reviewPayload: JsonObject = {event: normalized.decision, body};
-      if (normalized.inlineComments.length) reviewPayload.comments = normalized.inlineComments;
-      let response: JsonObject;
-      try {
-        response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token, reviewPayload)) as JsonObject;
-      } catch (error) {
-        if (!normalized.inlineComments.length) throw error;
-        response = (await githubRequest("POST", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, token, {event: normalized.decision, body: `${body}\n\n_Inline publication was unavailable; findings are included above._`})) as JsonObject;
-        normalized.validationIssues.push("inline finding locations were rejected by GitHub; findings were retained in the review body");
-      }
-      task.publication_state = "published_review";
-      task.publication_identity = identity;
-      task.publication_review_id = response.id;
-      task.publication_url = response.html_url;
-      task.publication_decision = normalized.decision;
-      writeJsonAtomic(recordPath, {identity, review_id: response.id, review_url: response.html_url, task_id: task.task_id, head_sha: ((task.review_evidence as JsonObject | undefined) || {}).head_sha, published_at: utcNow()});
-      return;
-    }
 
-    const body = publicationCommentBody(task, result, "Coven task result");
-    const method = task.publication_comment_id ? "PATCH" : "POST";
-    const url = task.publication_comment_id
-      ? `https://api.github.com/repos/${repo}/issues/comments/${Number(task.publication_comment_id)}`
-      : `https://api.github.com/repos/${repo}/issues/${Number(number)}/comments`;
-    const response = (await githubRequest(method, url, token, {body})) as JsonObject;
-    task.publication_state = method === "PATCH" ? "updated_comment" : "published_comment";
-    task.publication_identity = identity;
-    task.publication_url = response.html_url;
-    task.publication_comment_id = response.id;
-  } catch (error) {
-    task.publication_state = "publication_failed";
-    task.publication_error = redactTokenish(String((error as Error).stack || error));
+      if (task.publication_identity === identity && task.publication_comment_id) {
+        task.publication_state = "publication_skipped_duplicate";
+        clearPublicationError(task);
+        return;
+      }
+      const issueTrust = publicationTrust(config, task, `${repo}#issue:${Number(number)}`);
+      const body = `${safePublicationText(publicationCommentBody(task, result, "Coven task result"), 59_700)}\n\n${publicationMarker(issueTrust, identity, task.created_at)}`;
+      if (!task.publication_comment_id) {
+        const comments = await githubRequestAllPages(`https://api.github.com/repos/${repo}/issues/${Number(number)}/comments`, token);
+        const existing = publicationWithIdentity(comments, identity, issueTrust);
+        if (existing) {
+          task.publication_state = "publication_skipped_duplicate";
+          task.publication_identity = identity;
+          task.publication_url = existing.html_url;
+          task.publication_comment_id = existing.id;
+          clearPublicationError(task);
+          return;
+        }
+      }
+      const method = task.publication_comment_id ? "PATCH" : "POST";
+      const url = task.publication_comment_id
+        ? `https://api.github.com/repos/${repo}/issues/comments/${Number(task.publication_comment_id)}`
+        : `https://api.github.com/repos/${repo}/issues/${Number(number)}/comments`;
+      const response = (await githubRequest(method, url, token, {body})) as JsonObject;
+      task.publication_state = method === "PATCH" ? "updated_comment" : "published_comment";
+      task.publication_identity = identity;
+      task.publication_url = response.html_url;
+      task.publication_comment_id = response.id;
+      clearPublicationError(task);
+    } catch (error) {
+      task.publication_state = "publication_failed";
+      task.publication_error = redactTokenish(String((error as Error).stack || error));
+    }
+  } finally {
+    releasePublicationLock(publicationLock);
   }
 }
 
-function publicationReviewBody(task: JsonObject, result: JsonObject, normalized: NormalizedReviewPublication, previous: JsonObject): string {
-  const body = publicationCommentBody(task, result, "Coven review");
+function publicationReviewBody(task: JsonObject, result: JsonObject, normalized: NormalizedReviewPublication, previous: JsonObject, identity: string): string {
+  const renderedResult = normalized.evidenceComplete
+    ? {...result, review: normalized.review}
+    : {
+        ...result,
+        summary: "The runtime review output was downgraded because its publication evidence was incomplete or contradictory.",
+        pr_body: "",
+        review: normalized.review,
+      };
+  const body = publicationCommentBody(task, renderedResult, "Coven review");
   const additions: string[] = [];
-  if (previous.review_url && previous.identity !== task.publication_identity) additions.push(`This review supersedes [the prior covencat publication](${String(previous.review_url)}).`);
+  const previousUrl = previous.review_url || previous.html_url;
+  if (previousUrl && previous.identity !== identity) additions.push(`This review supersedes [the prior covencat publication](${String(previousUrl)}).`);
   if (normalized.validationIssues.length) additions.push(`### Publication validation\n- ${normalized.validationIssues.join("\n- ")}\n\nEvidence was incomplete or contradictory, so this is a COMMENT review rather than an approval or change request.`);
   if (normalized.review.findings && Array.isArray(normalized.review.findings) && normalized.inlineComments.length < normalized.review.findings.length) additions.push("### Findings without valid inline locations\nThe structured findings above remain part of this review body because their file/line locations could not be safely attached to the current diff.");
   return [body, ...additions].join("\n\n");
@@ -1364,15 +2053,18 @@ function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] 
   }
   const findings = Array.isArray(review.findings) ? (review.findings as JsonObject[]) : [];
   lines.push(`- Findings: ${findings.length}`);
-  findings.slice(0, 10).forEach((finding, index) => {
+  findings.slice(0, 40).forEach((finding, index) => {
     let location = String(finding.file || "unknown file");
     if (finding.line !== undefined && finding.line !== null) {
       location = `${location}:${finding.line}`;
     }
     lines.push(`  ${index + 1}. \`${finding.severity || "unknown"}\` ${location} - ${finding.title || "Untitled finding"}`);
+    if (finding.body) lines.push(`     - ${safePublicationText(String(finding.body), 700)}`);
+    if (finding.recommendation) lines.push(`     - Suggested resolution: ${safePublicationText(String(finding.recommendation), 500)}`);
   });
-  if (findings.length > 10) {
-    lines.push("- Findings truncated after 10 entries.");
+  if (findings.length > 40) {
+    const omitted = findings.length - 40;
+    lines.push(`- ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the GitHub review body is size-limited; inspect the persisted result artifact for the complete set.`);
   }
   if (review.no_findings_reason) {
     lines.push(`- No-findings reason: ${review.no_findings_reason}`);
@@ -1437,23 +2129,30 @@ function redactedCommandResult(result: CommandResult): JsonObject {
   };
 }
 
-function redactTokenish(text: string): string {
+export function sanitizedRuntimeEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of [
+    "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
+    "TMPDIR", "TEMP", "TMP", "SystemRoot", "SYSTEMROOT", "WINDIR",
+    "COMSPEC", "PATHEXT", "USERPROFILE",
+  ]) {
+    if (source[key] !== undefined) env[key] = source[key];
+  }
+  return env;
+}
+
+export function redactTokenish(text: string): string {
   if (!text) {
     return text;
   }
-  const markers = ["ghs_", "ghu_", "github_pat_", "x-access-token:"];
-  let redacted = text;
-  for (const marker of markers) {
-    while (redacted.includes(marker)) {
-      const index = redacted.indexOf(marker);
-      let end = index + marker.length;
-      while (end < redacted.length && !" \n\r\t'\"".includes(redacted[end])) {
-        end += 1;
-      }
-      redacted = `${redacted.slice(0, index)}${marker}[redacted]${redacted.slice(end)}`;
-    }
-  }
-  return redacted;
+  return text
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted private key]")
+    .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_-]{6,}/g, "[redacted github token]")
+    .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}/g, "[redacted OpenAI token]")
+    .replace(/\bBearer\s+[^\s'\"]+/gi, "Bearer [redacted]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted JWT]")
+    .replace(/x-access-token:[^@\s'\"]+/gi, "x-access-token:[redacted]")
+    .replace(/(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi, "$1[redacted]@");
 }
 
 function failTask(path: string, task: JsonObject, reason: string, detail: string): JsonObject {

@@ -106,15 +106,22 @@ connection guide in
   signed delivery -> policy route -> delivery/task/result state without calling
   GitHub or `coven-code`.
 - Captures PR checkout metadata and changed-file patches before invoking
-  `coven-code`.
+  `coven-code`, including paginated file lists and patch-completeness checks.
 - Publishes PR results as native GitHub reviews: complete no-finding evidence
   approves, actionable findings request changes, and incomplete or
   contradictory evidence is published as a comment review. Findings are made
   inline only when their captured diff location is valid; all other findings
-  remain in the review body.
+  remain in the review body. Decisive reviews are bound to the captured commit
+  and require full changed-file coverage, a clean matching checkout, and
+  verified passing test evidence. They are created pending, then submitted only
+  after a fresh head check; a concurrent head change causes a COMMENT downgrade
+  or automatic dismissal.
 - Persists publication identities and review/comment IDs in the configured
-  state directory so retries do not duplicate output and a newer review links
-  to the prior covencat publication it supersedes.
+  state directory, reconciles HMAC-signed App-authored identities with GitHub,
+  and serializes publication per PR so retries and concurrent runs do not
+  duplicate output.
+  Newer reviews link to superseded covencat output and dismiss its prior
+  decisive state when GitHub permits it.
 - Publishes non-PR task results and operational notices as issue comments,
   including structured `reviewed_files`, `supporting_files`, findings, test
   evidence, no-findings rationale, and limitations.
