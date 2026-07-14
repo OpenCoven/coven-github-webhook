@@ -32,8 +32,11 @@ pull requests against this repo. This is the agent-specific layer; read
 
 ## Repo-specific invariants (don't break these)
 
-- This is a **thin hosted forwarder**, not the app logic. Familiar/authority and
-  GitHub-App behavior lives in `coven-github` — don't reimplement it here.
+- This is the **hosted deployment adapter**, not the canonical product worker.
+  Familiar/authority rules, result contracts, and GitHub App product behavior
+  live in `coven-github`; keep only deployment-specific webhook verification,
+  evidence capture, runtime invocation, and safe GitHub transport here. Do not
+  fork or redefine the canonical contracts in this repository.
 - **Never commit webhook secrets, signing secrets, App private keys, or tokens.**
   Configuration comes from the deploy environment, not the repo.
 - **Always verify the GitHub webhook signature** (`X-Hub-Signature-256`) before
