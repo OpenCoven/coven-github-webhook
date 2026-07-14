@@ -40,6 +40,7 @@ COPY --from=egress /out/hosts /etc/hosts
 COPY --from=egress /out/egress-ipv4.txt /usr/share/coven/egress-ipv4.txt
 COPY --from=egress /out/egress-hosts.txt /usr/share/coven/egress-hosts.txt
 COPY deploy/probe-runtime.mjs /usr/share/coven/probe-runtime.mjs
+COPY deploy/verify-github-app.mjs /usr/share/coven/verify-github-app.mjs
 COPY --from=sandbox-rootfs / /opt/coven-runtime/rootfs
 COPY --from=build /src/dist /app/dist
 COPY --from=build /src/node_modules /app/node_modules
@@ -48,7 +49,8 @@ COPY deploy/worker-entrypoint.sh /usr/local/bin/coven-worker-entrypoint
 RUN chmod 0755 /usr/local/bin/coven-worker-entrypoint \
  && mkdir -p /var/lib/coven /run/coven-config /home/coven-service \
  && chown 1000:1000 /var/lib/coven /home/coven-service \
- && chmod 0700 /var/lib/coven /run/coven-config /home/coven-service
+ && chmod 0700 /var/lib/coven /home/coven-service \
+ && chmod 0755 /run/coven-config
 WORKDIR /app
 ENV NODE_ENV=production \
     HOME=/home/coven-service \

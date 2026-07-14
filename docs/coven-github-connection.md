@@ -198,6 +198,10 @@ do not enable DNS or widen the runtime network as a shortcut.
 Run `node /usr/share/coven/probe-runtime.mjs` with the production mounts and
 environment to execute the same bubblewrap read/write/network probe used by a
 real task before promotion.
+Run `node /usr/share/coven/verify-github-app.mjs` in the same image to verify
+the live installation has pull-request and push subscriptions plus the exact
+Contents, Pull requests, Issues, and Metadata authority needed by review and
+repair. A checked-in manifest is not evidence of the live App settings.
 
 This release passes the model credential to `coven-code`, so an untrusted
 checkout can still try to consume or encode it through the allowed model
