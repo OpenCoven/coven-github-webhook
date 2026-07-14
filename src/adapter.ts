@@ -2728,7 +2728,7 @@ export function trustedValidationFindings(task: JsonObject, receipts: JsonObject
   return findings;
 }
 
-function finalizeReviewResult(resultPath: string, attemptDir: string, receipts: JsonObject[], task: JsonObject): string {
+export function finalizeReviewResult(resultPath: string, attemptDir: string, receipts: JsonObject[], task: JsonObject): string {
   const result = readBoundedRuntimeResult(resultPath);
   const review = {...((result.review as JsonObject | undefined) || {})};
   let findings = Array.isArray(review.findings) ? review.findings : [];
@@ -2742,8 +2742,8 @@ function finalizeReviewResult(resultPath: string, attemptDir: string, receipts: 
     workspace_revision: receipt.workspace_revision,
   }));
   const limitations = Array.isArray(review.limitations) ? review.limitations : [];
-  const trustedExecutionPassed = receipts.length > 0 && receipts.every((receipt) => receipt.status === "passed");
-  review.limitations = trustedExecutionPassed
+  const trustedExecutionAvailable = receipts.length > 0;
+  review.limitations = trustedExecutionAvailable
     ? limitations.filter((item) => typeof item !== "string" || !executionOnlyLimitation(item))
     : limitations;
   if (findings.length) review.no_findings_reason = null;

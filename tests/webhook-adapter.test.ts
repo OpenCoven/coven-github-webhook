@@ -14,6 +14,7 @@ import {
   createFreshTaskAttemptDirectory,
   createConfig,
   createFollowupReviewTask,
+  finalizeReviewResult,
   githubRequestAllPages,
   handleRequest,
   inspectRepairDiff,
@@ -1757,6 +1758,27 @@ test("trusted validation derives findings only from failures mapped to verified 
   })]);
   assert.deepEqual(unrelated, []);
   assert.deepEqual(trustedValidationFindings(task, [trustedValidationReceipt()]), []);
+});
+
+test("trusted failed receipts replace model execution disclaimers without hiding substantive limitations", () => {
+  const root = mkdtempSync(join(tmpdir(), "coven-finalize-review-"));
+  const resultPath = join(root, "result.json");
+  const result = completeReview();
+  (result.review as JsonObject).limitations = [
+    "I did not execute the test suite locally.",
+    "The supplied patch for another changed file was truncated.",
+  ];
+  writeFileSync(resultPath, JSON.stringify(result));
+  const task = reviewTask("finalize-failed-receipt");
+  const finalPath = finalizeReviewResult(resultPath, root, [trustedValidationReceipt({
+    returncode: 1,
+    status: "failed",
+    output_summary: "/workspace/src/app.ts:12 validation failed",
+  })], task);
+  const finalized = JSON.parse(readFileSync(finalPath, "utf8")) as JsonObject;
+  const review = finalized.review as JsonObject;
+  assert.deepEqual(review.limitations, ["The supplied patch for another changed file was truncated."]);
+  assert.equal((review.findings as JsonObject[]).length, 1);
 });
 
 test("replaces runtime-authored test claims with trusted host receipts", async () => {
