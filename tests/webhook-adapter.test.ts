@@ -1078,6 +1078,7 @@ test("runtime sandbox exposes only explicit mounts and runtime env omits GitHub 
   }, "codex-only");
   assert.equal(runtimeEnv.HOME, "/home/coven");
   assert.equal(runtimeEnv.OPENAI_API_KEY, undefined);
+  assert.equal(runtimeEnv.COVEN_CODE_HOSTED_REVIEW, undefined);
   for (const key of ["GITHUB_APP_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "COVEN_GIT_TOKEN", "GIT_ASKPASS", "SSH_AUTH_SOCK"]) {
     assert.equal(runtimeEnv[key], undefined);
   }

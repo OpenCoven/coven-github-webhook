@@ -4573,7 +4573,6 @@ export function runtimeProcessEnvironment(source: NodeJS.ProcessEnv, codexAccess
     TMPDIR: "/tmp",
     GIT_TERMINAL_PROMPT: "0",
     COVEN_CODE_PROVIDER: "codex",
-    COVEN_CODE_HOSTED_REVIEW: "1",
   };
 }
 
