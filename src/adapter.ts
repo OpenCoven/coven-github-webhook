@@ -695,7 +695,7 @@ function repairPolicy(policy: JsonObject): JsonObject {
 
 function boundedRepairAttempts(policy: JsonObject): number {
   const requested = Number(repairPolicy(policy).max_attempts || 2);
-  return Number.isFinite(requested) ? Math.max(1, Math.min(3, Math.trunc(requested))) : 2;
+  return Number.isFinite(requested) ? Math.max(1, Math.min(10, Math.trunc(requested))) : 2;
 }
 
 function globPatternMatches(patternValue: JsonValue | undefined, path: string): boolean {
