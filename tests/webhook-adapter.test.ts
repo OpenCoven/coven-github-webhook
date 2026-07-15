@@ -858,6 +858,11 @@ test("repair eligibility fails closed for forks, protected branches, limits, rep
   assert.equal(repairEligibilityIssue({...task, target: {...(task.target as JsonObject), head_repo_id: 2}}, result, policy), "repair_fork_or_untrusted_head");
   assert.equal(repairEligibilityIssue({...task, target: {...(task.target as JsonObject), head_ref: "main"}}, result, policy), "repair_protected_branch");
   assert.equal(repairEligibilityIssue({...task, repair_iteration: 2}, result, policy), "repair_attempt_limit_reached");
+  const tenAttemptPolicy = {...policy, repair: {enabled: true, max_attempts: 10}};
+  assert.equal(repairEligibilityIssue({...task, repair_iteration: 9}, result, tenAttemptPolicy), null);
+  assert.equal(repairEligibilityIssue({...task, repair_iteration: 10}, result, tenAttemptPolicy), "repair_attempt_limit_reached");
+  const overLimitPolicy = {...policy, repair: {enabled: true, max_attempts: 100}};
+  assert.equal(repairEligibilityIssue({...task, repair_iteration: 10}, result, overLimitPolicy), "repair_attempt_limit_reached");
   assert.equal(repairEligibilityIssue(task, result, {...policy, kill_switch: true}), "repository_kill_switch");
   const signatureProbe = {...task, repair_history: [{finding_signature: "placeholder"}]};
   const initialIssue = repairEligibilityIssue(signatureProbe, result, policy);

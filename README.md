@@ -215,4 +215,4 @@ connection guide in
   protected branches and paths, oversized or unrelated diffs, stale heads, and
   failed validation; it then creates a Covencat-attributed non-force commit and
   queues a fresh review of the new SHA. The loop stops after the configured
-  `max_attempts` (clamped to 1-3) or on repeated findings or non-progress.
+  `max_attempts` (clamped to 1-10) or on repeated findings or non-progress.
