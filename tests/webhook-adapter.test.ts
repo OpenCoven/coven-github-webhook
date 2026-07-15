@@ -41,6 +41,7 @@ import {
   runTask,
   sanitizedRuntimeEnvironment,
   sessionBrief,
+  summarizePrFiles,
   trustedValidationFindings,
   waitForExpectedPullRevision,
   withEphemeralCodexCredential,
@@ -1995,6 +1996,56 @@ test("detects a patch already truncated by the GitHub files API", () => {
   const completePatch = "@@ -1,2 +1,2 @@\n-old one\n-old two\n+new one\n+new two";
   assert.equal(patchEvidenceIncomplete(completePatch, 2, 2), false);
   assert.equal(patchEvidenceIncomplete(completePatch.slice(0, -9), 2, 2), true);
+});
+
+test("uses complete exact-base/head patches instead of truncated GitHub API patches", () => {
+  const completePatch = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n-old one\n-old two\n+new one\n+new two";
+  const files = [{
+    filename: "src/a.ts",
+    status: "modified",
+    additions: 2,
+    deletions: 2,
+    changes: 4,
+    patch: completePatch.slice(0, -9),
+  }];
+  const localPatches = new Map([[
+    "src/a.ts",
+    {
+      args: ["git", "diff"],
+      returncode: 0,
+      stdout: completePatch,
+      stderr: "",
+      signal: null,
+      timed_out: false,
+      spawn_error: "",
+    },
+  ]]);
+
+  const [summary] = summarizePrFiles(files, localPatches);
+  assert.equal(summary.patch, completePatch);
+  assert.equal(summary.patch_source, "local_exact_base_head");
+  assert.equal(summary.patch_truncated, false);
+});
+
+test("fails closed when exact-base/head patch capture fails", () => {
+  const apiPatch = "@@ -1 +1 @@\n-old\n+new";
+  const files = [{filename: "src/a.ts", status: "modified", additions: 1, deletions: 1, changes: 2, patch: apiPatch}];
+  const localPatches = new Map([[
+    "src/a.ts",
+    {
+      args: ["git", "diff"],
+      returncode: 128,
+      stdout: "",
+      stderr: "bad revision",
+      signal: null,
+      timed_out: false,
+      spawn_error: "",
+    },
+  ]]);
+
+  const [summary] = summarizePrFiles(files, localPatches);
+  assert.equal(summary.patch_source, "github_files_api");
+  assert.equal(summary.patch_truncated, true);
 });
 
 test("rejects syntactically valid supporting paths that are missing from the checkout", () => {

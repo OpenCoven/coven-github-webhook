@@ -2884,6 +2884,18 @@ async function prepareReviewContext(
   }
   const files = await githubRequestAllPages(`https://api.github.com/repos/${repo}/pulls/${prNumber}/files`, token);
 
+  const fetchBase = runCommand([config.hostGitBin, "fetch", "--depth", "1", "origin", liveBase], workspace, env, 180);
+  writeJsonAtomic(join(attemptDir, "fetch-pr-base.json"), redactedCommandResult(fetchBase));
+  if (fetchBase.returncode !== 0) {
+    return {
+      kind: "pull_request",
+      pr_number: prNumber,
+      fetch_error: fetchBase.stderr,
+      metadata: summarizePr(pr),
+      files: summarizePrFiles(files, new Map()),
+    };
+  }
+
   const fetch = runCommand([config.hostGitBin, "fetch", "--depth", "1", "origin", `pull/${prNumber}/head`], workspace, env, 180);
   writeJsonAtomic(join(attemptDir, "fetch-pr.json"), redactedCommandResult(fetch));
   if (fetch.returncode !== 0) {
@@ -2892,7 +2904,7 @@ async function prepareReviewContext(
       pr_number: prNumber,
       fetch_error: fetch.stderr,
       metadata: summarizePr(pr),
-      files: summarizePrFiles(files),
+      files: summarizePrFiles(files, new Map()),
     };
   }
 
@@ -2913,11 +2925,37 @@ async function prepareReviewContext(
     spawn_error: [head.spawn_error, status.spawn_error].filter(Boolean).join("\n"),
   }));
 
+  const localPatches = new Map<string, CommandResult>();
+  const localPatchEvidence: JsonObject[] = [];
+  for (const file of files) {
+    const filename = String(file.filename || "");
+    if (!filename) continue;
+    const diffPaths = [...new Set([String(file.previous_filename || ""), filename].filter(Boolean))];
+    const diff = runCommand(
+      [config.hostGitBin, "diff", "--no-ext-diff", "--unified=3", liveBase, liveHead, "--", ...diffPaths],
+      workspace,
+      env,
+      180,
+    );
+    localPatches.set(filename, diff);
+    localPatchEvidence.push({
+      filename,
+      paths: diffPaths,
+      returncode: diff.returncode,
+      patch_bytes: Buffer.byteLength(diff.stdout, "utf8"),
+      patch_sha256: diff.returncode === 0 ? sha256(diff.stdout) : undefined,
+      stderr: redactTokenish(diff.stderr),
+      timed_out: diff.timed_out,
+      spawn_error: diff.spawn_error,
+    });
+  }
+  writeJsonAtomic(join(attemptDir, "local-pr-diff-evidence.json"), localPatchEvidence);
+
   return {
     kind: "pull_request",
     pr_number: prNumber,
     metadata: summarizePr(pr),
-    files: summarizePrFiles(files),
+    files: summarizePrFiles(files, localPatches),
     checkout: {
       fetch_returncode: fetch.returncode,
       checkout_returncode: checkout.returncode,
@@ -2944,19 +2982,30 @@ function summarizePr(pr: JsonObject): JsonObject {
   };
 }
 
-function summarizePrFiles(files: JsonObject[]): JsonObject[] {
+export function summarizePrFiles(files: JsonObject[], localPatches?: ReadonlyMap<string, CommandResult>): JsonObject[] {
   return (files || []).map((item) => {
-    const patch = String(item.patch || "");
+    const filename = String(item.filename || "");
+    const localPatch = localPatches?.get(filename);
+    const localCaptureRequired = localPatches !== undefined;
+    const localCaptureSucceeded = localPatch?.returncode === 0;
+    const patch = localCaptureSucceeded ? localPatch.stdout : String(item.patch || "");
     const patchTruncated = patchEvidenceIncomplete(patch, Number(item.additions || 0), Number(item.deletions || 0));
+    const binaryPatch = patch.includes("GIT binary patch") || patch.includes("Binary files ");
     return {
-      filename: item.filename,
+      filename,
       status: item.status,
       additions: item.additions,
       deletions: item.deletions,
       changes: item.changes,
       sha: item.sha,
-      patch: patch.slice(0, 12000),
-      patch_truncated: patch.length > 12000 || patchTruncated,
+      patch: localCaptureSucceeded ? patch : patch.slice(0, 12000),
+      patch_source: localCaptureSucceeded ? "local_exact_base_head" : "github_files_api",
+      patch_sha256: patch ? sha256(patch) : undefined,
+      patch_truncated: !patch.trim()
+        || binaryPatch
+        || patchTruncated
+        || (!localCaptureSucceeded && patch.length > 12000)
+        || (localCaptureRequired && !localCaptureSucceeded),
     };
   });
 }
