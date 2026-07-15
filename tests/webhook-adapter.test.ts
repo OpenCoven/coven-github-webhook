@@ -91,6 +91,7 @@ function reviewTask(taskId = "review-task"): JsonObject {
     review_evidence: {
       head_sha: "abc123",
       base_sha: "base123",
+      merge_base_sha: "merge-base123",
       workspace_head_sha: "abc123",
       publication_workspace_head_sha: "abc123",
       publication_workspace_clean: true,
@@ -1953,6 +1954,7 @@ test("accepts a deletion finding when the changed file is absent from the checke
   task.review_evidence = {
     head_sha: "abc123",
     base_sha: "base123",
+    merge_base_sha: "merge-base123",
     workspace_head_sha: "abc123",
     publication_workspace_head_sha: "abc123",
     publication_workspace_clean: true,

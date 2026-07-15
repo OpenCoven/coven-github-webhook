@@ -2890,6 +2890,16 @@ async function prepareReviewContext(
     throw new Error(`captured_pr_base_changed: expected ${String(target.base_sha)}, current ${liveBase || "missing"}`);
   }
   const files = await githubRequestAllPages(`https://api.github.com/repos/${repo}/pulls/${prNumber}/files`, token);
+  const comparison = (await githubRequest(
+    "GET",
+    `https://api.github.com/repos/${repo}/compare/${liveBase}...${liveHead}`,
+    token,
+  )) as JsonObject;
+  const mergeBase = String((((comparison.merge_base_commit as JsonObject | undefined) || {}).sha) || "");
+  if (!/^[a-f0-9]{40}$/i.test(mergeBase)) {
+    throw new Error("captured_pr_merge_base_missing");
+  }
+  const metadata = {...summarizePr(pr), merge_base_sha: mergeBase};
 
   const fetchBase = runCommand([config.hostGitBin, "fetch", "--depth", "1", "origin", liveBase], workspace, env, 180);
   writeJsonAtomic(join(attemptDir, "fetch-pr-base.json"), redactedCommandResult(fetchBase));
@@ -2898,7 +2908,21 @@ async function prepareReviewContext(
       kind: "pull_request",
       pr_number: prNumber,
       fetch_error: fetchBase.stderr,
-      metadata: summarizePr(pr),
+      metadata,
+      files: summarizePrFiles(files, new Map()),
+    };
+  }
+
+  const fetchMergeBase = mergeBase === liveBase
+    ? fetchBase
+    : runCommand([config.hostGitBin, "fetch", "--depth", "1", "origin", mergeBase], workspace, env, 180);
+  writeJsonAtomic(join(attemptDir, "fetch-pr-merge-base.json"), redactedCommandResult(fetchMergeBase));
+  if (fetchMergeBase.returncode !== 0) {
+    return {
+      kind: "pull_request",
+      pr_number: prNumber,
+      fetch_error: fetchMergeBase.stderr,
+      metadata,
       files: summarizePrFiles(files, new Map()),
     };
   }
@@ -2910,7 +2934,7 @@ async function prepareReviewContext(
       kind: "pull_request",
       pr_number: prNumber,
       fetch_error: fetch.stderr,
-      metadata: summarizePr(pr),
+      metadata,
       files: summarizePrFiles(files, new Map()),
     };
   }
@@ -2939,7 +2963,7 @@ async function prepareReviewContext(
     if (!filename) continue;
     const diffPaths = [...new Set([String(file.previous_filename || ""), filename].filter(Boolean))];
     const diff = runCommand(
-      [config.hostGitBin, "diff", "--no-ext-diff", "--unified=3", liveBase, liveHead, "--", ...diffPaths],
+      [config.hostGitBin, "diff", "--no-ext-diff", "--unified=3", mergeBase, liveHead, "--", ...diffPaths],
       workspace,
       env,
       180,
@@ -2962,7 +2986,7 @@ async function prepareReviewContext(
   return {
     kind: "pull_request",
     pr_number: prNumber,
-    metadata: summarizePr(pr),
+    metadata,
     files: summarizePrFiles(files, localPatches),
     checkout: {
       fetch_returncode: fetch.returncode,
@@ -3042,6 +3066,7 @@ function reviewEvidence(reviewContext: JsonObject, reviewContextPath: string, ta
     pr_number: reviewContext.pr_number,
     base_ref: metadata.base_ref,
     base_sha: metadata.base_sha,
+    merge_base_sha: metadata.merge_base_sha,
     head_ref: metadata.head_ref,
     head_sha: metadata.head_sha,
     workspace_head_sha: checkout.workspace_head_sha,
@@ -4003,6 +4028,7 @@ export function normalizeReviewPublication(
   if (result.status !== "success") validationIssues.push("runtime result was not successful");
   if (!String(evidence.head_sha || "").trim()) validationIssues.push("PR head revision is missing");
   if (!String(evidence.base_sha || "").trim()) validationIssues.push("PR base revision is missing");
+  if (!String(evidence.merge_base_sha || "").trim()) validationIssues.push("PR merge-base revision is missing");
   if (!String(evidence.workspace_head_sha || "").trim()) validationIssues.push("checked-out revision is missing");
   if (evidence.workspace_head_sha !== evidence.head_sha) validationIssues.push("checked-out revision does not match the captured PR head");
   if (!String(evidence.publication_workspace_head_sha || "").trim()) validationIssues.push("post-run workspace revision is missing");
@@ -4427,6 +4453,7 @@ function publicationCommentBody(task: JsonObject, result: JsonObject, heading = 
     parts.push(
       `- PR: #${evidence.pr_number}`,
       `- Base: \`${evidence.base_ref}\` @ \`${evidence.base_sha}\``,
+      `- Merge base: \`${evidence.merge_base_sha}\``,
       `- Head: \`${evidence.head_ref}\` @ \`${evidence.head_sha}\``,
       `- Checked-out workspace HEAD: \`${evidence.workspace_head_sha}\``,
       `- Changed files supplied to agent: ${evidence.changed_file_count}`,
