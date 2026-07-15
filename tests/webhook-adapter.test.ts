@@ -2048,6 +2048,28 @@ test("fails closed when exact-base/head patch capture fails", () => {
   assert.equal(summary.patch_truncated, true);
 });
 
+test("fails closed when the local exact-base/head command output was truncated", () => {
+  const completePatch = "@@ -1 +1 @@\n-old\n+new";
+  const files = [{filename: "src/a.ts", status: "modified", additions: 1, deletions: 1, changes: 2, patch: completePatch}];
+  const localPatches = new Map([[
+    "src/a.ts",
+    {
+      args: ["git", "diff"],
+      returncode: 0,
+      stdout: completePatch,
+      stderr: "",
+      signal: null,
+      timed_out: false,
+      spawn_error: "",
+      stdout_truncated: true,
+    },
+  ]]);
+
+  const [summary] = summarizePrFiles(files, localPatches);
+  assert.equal(summary.patch_source, "github_files_api");
+  assert.equal(summary.patch_truncated, true);
+});
+
 test("rejects syntactically valid supporting paths that are missing from the checkout", () => {
   const root = tempStateDir();
   const task = reviewTask();

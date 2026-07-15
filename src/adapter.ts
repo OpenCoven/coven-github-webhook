@@ -1167,9 +1167,16 @@ async function routeClaimedDelivery(
   };
 }
 
-function runCommand(args: string[], cwd?: string, env?: NodeJS.ProcessEnv, timeoutSeconds = 300): CommandResult {
+function runCommand(
+  args: string[],
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
+  timeoutSeconds = 300,
+  retainedOutputBytes = 8000,
+): CommandResult {
   const startedAt = Date.now();
   const maxOutputBytes = 2 * 1024 * 1024;
+  const retainedBytes = Math.max(1, Math.min(retainedOutputBytes, maxOutputBytes));
   const proc = spawnSync(args[0], args.slice(1), {
     cwd,
     env,
@@ -1183,10 +1190,10 @@ function runCommand(args: string[], cwd?: string, env?: NodeJS.ProcessEnv, timeo
   return {
     args,
     returncode: proc.status ?? 125,
-    stdout: stdout.slice(-8000),
-    stderr: stderr.slice(-8000),
-    stdout_truncated: stdout.length > 8000,
-    stderr_truncated: stderr.length > 8000,
+    stdout: stdout.slice(-retainedBytes),
+    stderr: stderr.slice(-retainedBytes),
+    stdout_truncated: Buffer.byteLength(stdout, "utf8") > retainedBytes,
+    stderr_truncated: Buffer.byteLength(stderr, "utf8") > retainedBytes,
     output_limit_bytes: maxOutputBytes,
     duration_ms: Date.now() - startedAt,
     signal: proc.signal || null,
@@ -2936,6 +2943,7 @@ async function prepareReviewContext(
       workspace,
       env,
       180,
+      2 * 1024 * 1024,
     );
     localPatches.set(filename, diff);
     localPatchEvidence.push({
@@ -2987,7 +2995,7 @@ export function summarizePrFiles(files: JsonObject[], localPatches?: ReadonlyMap
     const filename = String(item.filename || "");
     const localPatch = localPatches?.get(filename);
     const localCaptureRequired = localPatches !== undefined;
-    const localCaptureSucceeded = localPatch?.returncode === 0;
+    const localCaptureSucceeded = localPatch?.returncode === 0 && localPatch.stdout_truncated !== true;
     const patch = localCaptureSucceeded ? localPatch.stdout : String(item.patch || "");
     const patchTruncated = patchEvidenceIncomplete(patch, Number(item.additions || 0), Number(item.deletions || 0));
     const binaryPatch = patch.includes("GIT binary patch") || patch.includes("Binary files ");
