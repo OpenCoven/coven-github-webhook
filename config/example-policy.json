@@ -7,7 +7,11 @@
           "enabled_triggers": [
             "issues.labeled",
             "issue_comment.created",
-            "pull_request_review_comment.created"
+            "pull_request_review_comment.created",
+            "pull_request.synchronize",
+            "pull_request.edited",
+            "pull_request.reopened",
+            "push"
           ],
           "trigger_labels": [
             "coven:fix",

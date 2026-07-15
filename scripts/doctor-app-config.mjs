@@ -1,8 +1,16 @@
 #!/usr/bin/env node
-import {existsSync, readFileSync} from "node:fs";
+import {existsSync, mkdtempSync, readFileSync, rmSync} from "node:fs";
+import {tmpdir} from "node:os";
 import {join} from "node:path";
 
-import {createConfig} from "../dist/src/adapter.js";
+import {createConfig, probeRuntimeIsolation, runtimeIsolationIssue} from "../dist/src/adapter.js";
+
+const NATIVE_REVIEW_SAFETY_TRIGGERS = [
+  "pull_request.synchronize",
+  "pull_request.edited",
+  "pull_request.reopened",
+  "push",
+];
 
 function finding(level, field, message, next) {
   return {level, field, message, next};
@@ -45,6 +53,7 @@ if (!config.privateKeyPem && !existsSync(config.privateKeyPath)) {
 }
 
 const policy = loadJson(config.policyPath);
+let requiresRevocationEvents = false;
 if (!policy) {
   findings.push(finding("error", "COVEN_GITHUB_POLICY_PATH", "policy file is missing or invalid JSON", "Copy config/example-policy.json and replace the installation/repository IDs."));
 } else {
@@ -64,11 +73,49 @@ if (!policy) {
     if (Object.keys(repos).includes("987654321")) {
       findings.push(finding("error", "policy.repositories", "policy still uses placeholder repository ID 987654321", "Replace it with the real repository ID."));
     }
+    for (const [repositoryId, route] of Object.entries(repos)) {
+      if (route?.publication?.mode !== "comment") continue;
+      requiresRevocationEvents = true;
+      const enabledTriggers = new Set(Array.isArray(route.enabled_triggers) ? route.enabled_triggers.map(String) : []);
+      for (const trigger of NATIVE_REVIEW_SAFETY_TRIGGERS) {
+        if (!enabledTriggers.has(trigger)) {
+          const field = `policy.installations.${installationId}.repositories.${repositoryId}.enabled_triggers`;
+          findings.push(finding(
+            "error",
+            field,
+            `native review publication requires ${trigger}`,
+            `Add ${trigger} to enabled_triggers and subscribe the GitHub App to the corresponding webhook event, or use publication.mode=record_only.`,
+          ));
+        }
+      }
+    }
   }
 }
 
-if (!process.env.COVEN_CODE_BIN && !config.demoMode) {
-  findings.push(finding("warning", "COVEN_CODE_BIN", "COVEN_CODE_BIN is not set", "Set it to the coven-code binary path before running real tasks."));
+if (requiresRevocationEvents && !config.revocationEventsVerified) {
+  findings.push(finding(
+    "error",
+    "COVEN_GITHUB_REVOCATION_EVENTS",
+    "native review publication requires verified pull_request and push delivery subscriptions on the installed GitHub App",
+    "Verify the live App subscriptions, then set COVEN_GITHUB_REVOCATION_EVENTS=pull-request-and-push-verified; otherwise use publication.mode=record_only.",
+  ));
+}
+
+if (!config.demoMode) {
+  const isolationIssue = runtimeIsolationIssue(config);
+  if (isolationIssue) {
+    findings.push(finding("error", "COVEN_RUNTIME_ISOLATION", isolationIssue, "Configure COVEN_RUNTIME_ISOLATION=bwrap with a dedicated rootfs and absolute runtime binary paths. There is no direct-execution fallback."));
+  } else {
+    const probeDir = mkdtempSync(join(tmpdir(), "coven-runtime-doctor-"));
+    try {
+      const probeIssue = probeRuntimeIsolation(config, probeDir);
+      if (probeIssue) {
+        findings.push(finding("error", "COVEN_RUNTIME_ISOLATION", probeIssue, "Fix bubblewrap/user-namespace support or keep real task execution disabled."));
+      }
+    } finally {
+      rmSync(probeDir, {recursive: true, force: true});
+    }
+  }
 }
 
 const errors = findings.filter((item) => item.level === "error");
@@ -81,6 +128,10 @@ const output = {
     private_key: Boolean(config.privateKeyPem || existsSync(config.privateKeyPath)),
     policy_path: config.policyPath,
     state_dir: config.stateDir,
+    runtime_isolation: config.runtimeIsolation,
+    runtime_external_isolation: config.runtimeExternalIsolationVerified,
+    revocation_events: config.revocationEventsVerified,
+    runtime_rootfs: config.runtimeRootfs || null,
   },
   findings,
 };
