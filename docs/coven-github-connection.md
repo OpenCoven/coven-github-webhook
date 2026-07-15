@@ -124,7 +124,7 @@ file reads, searches, PR text, and model narratives are never execution proof.
 Autoreview and branch repair are independent repository opt-ins. Configure
 `autoreview.enabled` for exact-SHA reviews and optionally `include_drafts`.
 Configure `repair.enabled` only for trusted same-repository branches, with
-`max_attempts` from 1 through 3, bounded `allowed_paths`, `protected_paths`,
+`max_attempts` from 1 through 10, bounded `allowed_paths`, `protected_paths`,
 `protected_branches`, `max_changed_files`, and `max_diff_bytes`. Repair sessions
 receive file tools only; the host performs validation, commit, and non-force push
 with a fresh repository-scoped installation token. Set `kill_switch` at the
