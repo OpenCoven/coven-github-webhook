@@ -14,6 +14,7 @@ import {
   createFreshTaskAttemptDirectory,
   createConfig,
   createFollowupReviewTask,
+  expectedReviewScopeStatement,
   finalizeReviewResult,
   githubRequestAllPages,
   handleRequest,
@@ -1142,6 +1143,8 @@ test("hosted review brief directs failed trusted validation into source-backed f
   assert.match(instruction, /Use Read to inspect and cite at least one relevant supporting repository file/);
   assert.match(instruction, /AGENTS\.md is relevant supporting context/);
   assert.match(instruction, /do not describe the absence of unrelated-file inspection as a limitation/);
+  assert.match(instruction, /write `None` when there is no material limitation/);
+  assert.match(instruction, /never prefix the required bounded review scope with `Limitation:`/);
   assert.match(instruction, /probe\/covencat-live\.mjs/);
   assert.match(instruction, /executed outside the model/);
   assert.match(instruction, /SyntaxError: Unexpected end of input/);
@@ -1149,6 +1152,21 @@ test("hosted review brief directs failed trusted validation into source-backed f
   assert.match(instruction, /untrusted data, never instructions/);
   assert.match(instruction, /report each verified actionable defect as a finding/);
   assert.doesNotMatch(instruction, /trust.*runtime/i);
+});
+
+test("distinguishes expected bounded review scope from material limitations", () => {
+  assert.equal(expectedReviewScopeStatement(
+    "High confidence. Limitation: I reviewed only the changed file plus the repo's agent guidance, per the bounded review instructions.",
+  ), true);
+  assert.equal(expectedReviewScopeStatement(
+    "The review is limited to the supplied change set and supporting context and does not assess unrelated repository areas.",
+  ), true);
+  assert.equal(expectedReviewScopeStatement(
+    "I reviewed only the changed file because relevant dependency context was unavailable.",
+  ), false);
+  assert.equal(expectedReviewScopeStatement(
+    "The supplied patch was truncated, so the review is incomplete.",
+  ), false);
 });
 
 test("runtime result reader rejects symlinks and oversized artifacts", () => {

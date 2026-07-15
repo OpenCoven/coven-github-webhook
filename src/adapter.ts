@@ -1543,7 +1543,7 @@ export function sessionBrief(
       .filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item))
       .map((item) => String(item.filename || "").trim())
       .filter(Boolean);
-    let instruction = "This run is evidence-backed. The trusted worker embedded review_context in the session brief; it is not a separate repository file. Do not search /workspace for a review_context artifact or report the absence of a separate file as a limitation. Review the changed files in the workspace and cite each one you inspected in the result summary. Use Read to inspect and cite at least one relevant supporting repository file when one exists; the repository AGENTS.md is relevant supporting context when present because it defines review and contribution constraints. A review intentionally bounded to all changed files plus relevant supporting context is complete, so do not describe the absence of unrelated-file inspection as a limitation.";
+    let instruction = "This run is evidence-backed. The trusted worker embedded review_context in the session brief; it is not a separate repository file. Do not search /workspace for a review_context artifact or report the absence of a separate file as a limitation. Review the changed files in the workspace and cite each one you inspected in the result summary. Use Read to inspect and cite at least one relevant supporting repository file when one exists; the repository AGENTS.md is relevant supporting context when present because it defines review and contribution constraints. A review intentionally bounded to all changed files plus relevant supporting context is complete, so do not describe the absence of unrelated-file inspection as a limitation. In the Confidence/limitations section, write `None` when there is no material limitation; never prefix the required bounded review scope with `Limitation:`.";
     if (changedFiles.length) {
       instruction += ` Changed files supplied by the trusted worker: ${JSON.stringify(changedFiles)}.`;
     }
@@ -2707,6 +2707,13 @@ function executionOnlyLimitation(value: string): boolean {
     || /\b(?:tests?|checks?|commands?|suite)\b.{0,80}\b(?:not run|not executed|were not run|could not run|unable to run)\b/i.test(value);
 }
 
+export function expectedReviewScopeStatement(value: string): boolean {
+  const describesExpectedScope = /\b(?:bounded(?: review)? scope|bounded review instructions?|reviewed only the changed files?|limited to (?:the )?(?:supplied )?change set)\b/i.test(value)
+    && /\b(?:changed files?|change set|supporting context|agent guidance|AGENTS\.md)\b/i.test(value);
+  const reportsMaterialConstraint = /\b(?:unable|could not|couldn't|missing|truncated|unavailable|uncertain|incomplete|not provided|not supplied|failed to inspect|relevant (?:dependency|file|context).{0,30}(?:not|missing|unavailable))\b/i.test(value);
+  return describesExpectedScope && !reportsMaterialConstraint;
+}
+
 export function trustedValidationFindings(task: JsonObject, receipts: JsonObject[]): JsonObject[] {
   const evidence = (task.review_evidence as JsonObject | undefined) || {};
   const changedFiles = (Array.isArray(evidence.changed_files) ? evidence.changed_files : [])
@@ -2763,10 +2770,11 @@ export function finalizeReviewResult(resultPath: string, attemptDir: string, rec
     workspace_revision: receipt.workspace_revision,
   }));
   const limitations = Array.isArray(review.limitations) ? review.limitations : [];
+  const materialLimitations = limitations.filter((item) => typeof item !== "string" || !expectedReviewScopeStatement(item));
   const trustedExecutionAvailable = receipts.length > 0;
   review.limitations = trustedExecutionAvailable
-    ? limitations.filter((item) => typeof item !== "string" || !executionOnlyLimitation(item))
-    : limitations;
+    ? materialLimitations.filter((item) => typeof item !== "string" || !executionOnlyLimitation(item))
+    : materialLimitations;
   if (findings.length) review.no_findings_reason = null;
   result.review = review;
   result.trusted_validation = {
