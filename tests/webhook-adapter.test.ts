@@ -1280,6 +1280,7 @@ test("publication body links screenshot-style file mentions to GitHub blobs", ()
         "- Fixed a bug, e.g. the parser broke.",
         "- In other words, i.e. no bogus abbreviation links.",
         "- Mentioned foo.bar.baz.qux in prose.",
+        "- Compared `agent/pr9-resolution`, `release/v1.2.3`, and `OpenCoven/coven-github`.",
         "- Grep for https://github.com/OpenCoven/coven-github-webhook/blob/main/src/adapter.ts and tests_run[].output_summary.",
         "- `README.md:12`",
         "- `README.md:12-14`",
@@ -1339,6 +1340,10 @@ test("publication body links screenshot-style file mentions to GitHub blobs", ()
   assert.doesNotMatch(body, /\[`e\.g`\]/);
   assert.doesNotMatch(body, /\[`i\.e`\]/);
   assert.doesNotMatch(body, /\[`foo\.bar\.baz\.qux`\]/);
+  assert.match(body, /Compared `agent\/pr9-resolution`, `release\/v1\.2\.3`, and `OpenCoven\/coven-github`/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/agent\/pr9-resolution/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/release\/v1\.2\.3/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/OpenCoven\/coven-github/);
   assert.match(
     body,
     /\[`README\.md:12`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/README\.md#L12\)/,

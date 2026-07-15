@@ -4556,7 +4556,9 @@ function parseRepoRelativePath(rawPath: string): {display: string; path: string;
 }
 
 function githubFileMentionAllowed(target: NonNullable<ReturnType<typeof parseRepoRelativePath>>, knownFiles: Set<string>): boolean {
-  return knownFiles.has(target.path) || (!/\s/.test(target.display) && target.path.includes("/"));
+  const filename = target.path.split("/").at(-1) || "";
+  return knownFiles.has(target.path)
+    || (!/\s/.test(target.display) && target.path.includes("/") && /\.[A-Za-z][A-Za-z0-9._-]{0,15}$/.test(filename));
 }
 
 function githubFileMarkdown(
