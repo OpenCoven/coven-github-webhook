@@ -1119,6 +1119,9 @@ test("hosted review brief directs failed trusted validation into source-backed f
   assert.match(instruction, /embedded review_context in the session brief/);
   assert.match(instruction, /not a separate repository file/);
   assert.match(instruction, /Do not search \/workspace for a review_context artifact/);
+  assert.match(instruction, /Use Read to inspect and cite at least one relevant supporting repository file/);
+  assert.match(instruction, /AGENTS\.md is relevant supporting context/);
+  assert.match(instruction, /do not describe the absence of unrelated-file inspection as a limitation/);
   assert.match(instruction, /probe\/covencat-live\.mjs/);
   assert.match(instruction, /executed outside the model/);
   assert.match(instruction, /SyntaxError: Unexpected end of input/);

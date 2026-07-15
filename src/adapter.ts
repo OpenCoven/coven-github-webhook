@@ -1543,7 +1543,7 @@ export function sessionBrief(
       .filter((item): item is JsonObject => Boolean(item) && typeof item === "object" && !Array.isArray(item))
       .map((item) => String(item.filename || "").trim())
       .filter(Boolean);
-    let instruction = "This run is evidence-backed. The trusted worker embedded review_context in the session brief; it is not a separate repository file. Do not search /workspace for a review_context artifact or report the absence of a separate file as a limitation. Review the changed files in the workspace and cite each one you inspected in the result summary.";
+    let instruction = "This run is evidence-backed. The trusted worker embedded review_context in the session brief; it is not a separate repository file. Do not search /workspace for a review_context artifact or report the absence of a separate file as a limitation. Review the changed files in the workspace and cite each one you inspected in the result summary. Use Read to inspect and cite at least one relevant supporting repository file when one exists; the repository AGENTS.md is relevant supporting context when present because it defines review and contribution constraints. A review intentionally bounded to all changed files plus relevant supporting context is complete, so do not describe the absence of unrelated-file inspection as a limitation.";
     if (changedFiles.length) {
       instruction += ` Changed files supplied by the trusted worker: ${JSON.stringify(changedFiles)}.`;
     }
