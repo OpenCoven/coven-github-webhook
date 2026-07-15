@@ -2075,6 +2075,32 @@ test("fails closed when the local exact-base/head command output was truncated",
   assert.equal(summary.patch_truncated, true);
 });
 
+test("does not treat binary marker text inside a changed source line as a binary patch", () => {
+  const sourcePatch = '@@ -1 +1 @@\n-old\n+const marker = "GIT binary patch";';
+  const files = [{filename: "src/a.ts", status: "modified", additions: 1, deletions: 1, changes: 2, patch: sourcePatch}];
+  const localPatches = new Map([[
+    "src/a.ts",
+    {
+      args: ["git", "diff"], returncode: 0, stdout: sourcePatch, stderr: "", signal: null, timed_out: false, spawn_error: "",
+    },
+  ]]);
+
+  assert.equal(summarizePrFiles(files, localPatches)[0].patch_truncated, false);
+});
+
+test("fails closed for an actual Git binary patch marker", () => {
+  const binaryPatch = "diff --git a/image.png b/image.png\nGIT binary patch\nliteral 1\nAcmZQz";
+  const files = [{filename: "image.png", status: "modified", additions: 0, deletions: 0, changes: 0, patch: ""}];
+  const localPatches = new Map([[
+    "image.png",
+    {
+      args: ["git", "diff"], returncode: 0, stdout: binaryPatch, stderr: "", signal: null, timed_out: false, spawn_error: "",
+    },
+  ]]);
+
+  assert.equal(summarizePrFiles(files, localPatches)[0].patch_truncated, true);
+});
+
 test("rejects syntactically valid supporting paths that are missing from the checkout", () => {
   const root = tempStateDir();
   const task = reviewTask();

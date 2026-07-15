@@ -3022,7 +3022,7 @@ export function summarizePrFiles(files: JsonObject[], localPatches?: ReadonlyMap
     const localCaptureSucceeded = localPatch?.returncode === 0 && localPatch.stdout_truncated !== true;
     const patch = localCaptureSucceeded ? localPatch.stdout : String(item.patch || "");
     const patchTruncated = patchEvidenceIncomplete(patch, Number(item.additions || 0), Number(item.deletions || 0));
-    const binaryPatch = patch.includes("GIT binary patch") || patch.includes("Binary files ");
+    const binaryPatch = /(?:^|\n)(?:GIT binary patch|Binary files .+ differ)(?:\n|$)/.test(patch);
     return {
       filename,
       status: item.status,
