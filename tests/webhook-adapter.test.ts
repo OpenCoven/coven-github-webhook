@@ -20,6 +20,7 @@ import {
   handleRequest,
   inspectRepairDiff,
   loadFreshCodexAccessToken,
+  publicationCommentBody,
   normalizeReviewPublication,
   patchEvidenceIncomplete,
   publicationInstallationTokenRequest,
@@ -1268,6 +1269,348 @@ test("example policy routes a labeled issue to the configured familiar", () => {
   });
 });
 
+test("publication body links screenshot-style file mentions to GitHub blobs", () => {
+  const body = publicationCommentBody(
+    {
+      task_id: "task-file-links",
+      repository: "OpenCoven/coven-github-webhook",
+      default_branch: "main",
+      review_evidence: {
+        head_sha: "abc123def456",
+      },
+    },
+    {
+      status: "success",
+      summary: [
+        "### Files inspected",
+        "",
+        "- `src/lib/server/skills-directory.ts`",
+        "- `Read src/lib/server/skill-scan.ts`",
+        "- Read src/lib/server/skill-scan.ts - passed: inspected adapter implementation.",
+        "- Read AGENTS.md - passed: reviewed guidance.",
+        "- Fixed a bug, e.g. the parser broke.",
+        "- In other words, i.e. no bogus abbreviation links.",
+        "- Mentioned foo.bar.baz.qux in prose.",
+        "- Compared `agent/pr9-resolution`, `release/v1.2.3`, and `OpenCoven/coven-github`.",
+        "- Grep for https://github.com/OpenCoven/coven-github-webhook/blob/main/src/adapter.ts and tests_run[].output_summary.",
+        "- `README.md:12`",
+        "- `README.md:12-14`",
+        "- `Dockerfile:7`",
+        "- `report:2026`",
+        "- `x:foo`",
+        "- `docs/My Guide.md`",
+        "- `Dockerfile`",
+        "- `docs)/odd(file).ts`",
+        "- ``docs/a`b.ts``",
+        "- `docs\\guide.ts`",
+        "- `docs/report:2026`",
+        "- `tests_run[].output_summary`",
+        "- `pnpm test`",
+        "- [`src/already.ts`](https://example.com/already)",
+        "- [see `src/mixed.ts`](https://example.com/mixed)",
+        "- [`src/reference.ts`][source]",
+        "- [`src/collapsed.ts`][]",
+        "- [`src/shortcut.ts`]",
+        "- ![see `src/image.ts`](https://example.com/image.png)",
+        "- [see src/bare-reference.ts][bare-source]",
+        "- [title](https://example.com/path \"see `src/title.ts`\")",
+        "- [see ` src/unmatched-label.ts](https://example.com/unmatched-label)",
+        "- <span data-path=\"src/attribute.ts\">attribute</span>",
+        "[source]: src/reference-target.ts",
+        "[bare-source]: src/bare-reference.ts",
+        "[escaped\\]source]: src/escaped-definition.ts",
+        "[multiline-source]:",
+        "  src/multiline-definition.ts",
+        "  \"Optional title\"",
+        "- Plain https://example.com/view?file=src/query.ts#L2",
+        "- Other URLs ftp://example.com/?file=src/ftp.ts file:///tmp/?file=src/file-url.ts mailto:user@example.com?body=src/mail.ts",
+        "- Short URI x:foo?path=src/short-scheme.ts and localhost/docs/local.ts",
+        "- Hostnames www.example.com/docs/www.ts, example.com/docs/domain.ts, www.example.com/?file=src/www-query.ts, example.com/?file=src/domain-query.ts, 192.168.1.2/?file=src/ip-query.ts, [::1]/?file=src/ipv6-query.ts, and //example.com/?file=src/protocol-relative.ts",
+        "- Assigned URLs url=www.example.com/?file=src/assigned-url.ts and href=https://example.com/?file=src/assigned-href.ts",
+        "- Emphasized URLs **https://example.com/?file=src/emphasis-bold.ts**, _https://example.com/?file=src/emphasis-underscore.ts_, ~~https://example.com/?file=src/emphasis-strike.ts~~, and **www.example.com/?file=src/emphasis-www.ts**",
+        "- Emphasized file _src/lib/server/skills-directory.ts_",
+        "- Escaped backtick \\` [see `src/escaped-prefix.ts`](https://example.com/escaped-prefix)",
+        "- Backticks in a destination [x](dest`) src/backtick-after-link.ts `)",
+        "- Nested destination [x](foo`(`bar)q=src/backtick-in-link.ts)",
+        "- Nested leading destination [x](() \"title ) q=src/nested-title.ts\")",
+        "- Empty destination title [x]( \"title ) q=src/empty-title.ts\")",
+        "- Escaped leading destination [x](\\( \"title ) q=src/escaped-title.ts\")",
+        "- Sentence final src/sentence.ts.",
+        "[unused-reference]:",
+        "```ts",
+        "`src/not-linked-after-reference.ts`",
+        "```",
+        "- After reference fence src/after-reference.ts",
+        "",
+        "```ts",
+        "`src/not-linked-inside-fence.ts`",
+        "```",
+        "   ~~~~ts",
+        "`src/not-linked-inside-tilde-fence.ts`",
+        "   ~~~~",
+        "````ts",
+        "`src/not-linked-inside-long-fence.ts`",
+        "````",
+        "    `src/not-linked-inside-indent.ts`",
+        "\t`src/not-linked-inside-tab.ts`",
+      ].join("\n"),
+      pr_body: "Follow-up evidence is in `src/follow-up.ts`.",
+      review: {
+        supporting_files: [
+          "AGENTS.md",
+          "README.md",
+          "docs/My Guide.md",
+          "Dockerfile",
+          "report:2026",
+          "x:foo",
+          "docs)/odd(file).ts",
+          "docs/a`b.ts",
+          "docs\\guide.ts",
+          "docs/report:2026",
+          "`leading.ts",
+          "trailing.ts`",
+          "src/follow-up.ts",
+        ],
+      },
+    },
+  );
+
+  assert.match(
+    body,
+    /\[`src\/lib\/server\/skills-directory\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skills-directory\.ts\)/,
+  );
+  assert.match(
+    body,
+    /`Read` \[`src\/lib\/server\/skill-scan\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skill-scan\.ts\)/,
+  );
+  assert.match(
+    body,
+    /Read \[`src\/lib\/server\/skill-scan\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skill-scan\.ts\) - passed/,
+  );
+  assert.match(
+    body,
+    /Read \[`AGENTS\.md`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/AGENTS\.md\) - passed/,
+  );
+  assert.match(body, /https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/main\/src\/adapter\.ts/);
+  assert.match(body, /e\.g\. the parser broke/);
+  assert.match(body, /i\.e\. no bogus abbreviation links/);
+  assert.match(body, /foo\.bar\.baz\.qux in prose/);
+  assert.doesNotMatch(body, /\[`e\.g`\]/);
+  assert.doesNotMatch(body, /\[`i\.e`\]/);
+  assert.doesNotMatch(body, /\[`foo\.bar\.baz\.qux`\]/);
+  assert.match(body, /Compared `agent\/pr9-resolution`, `release\/v1\.2\.3`, and `OpenCoven\/coven-github`/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/agent\/pr9-resolution/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/release\/v1\.2\.3/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/OpenCoven\/coven-github/);
+  assert.match(
+    body,
+    /\[`README\.md:12`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/README\.md#L12\)/,
+  );
+  assert.match(
+    body,
+    /\[`README\.md:12-14`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/README\.md#L12-L14\)/,
+  );
+  assert.match(body, /\[`Dockerfile:7`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/Dockerfile#L7\)/);
+  assert.match(body, /\[`report:2026`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/report%3A2026\)/);
+  assert.match(body, /\[`x:foo`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/x%3Afoo\)/);
+  assert.match(body, /- `pnpm test`/);
+  assert.match(body, /- `tests_run\[\]\.output_summary`/);
+  assert.doesNotMatch(body, /\[`tests_run\[\]\.output_summary`\]/);
+  assert.doesNotMatch(body, /blob\/main\/\[`src\/adapter\.ts`\]/);
+  assert.match(body, /\[`docs\/My Guide\.md`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/docs\/My%20Guide\.md\)/);
+  assert.match(body, /\[`Dockerfile`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/Dockerfile\)/);
+  assert.match(body, /docs%29\/odd%28file%29\.ts/);
+  assert.match(body, /\[``docs\/a`b\.ts``\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/docs\/a%60b\.ts\)/);
+  assert.match(body, /blob\/abc123def456\/docs%5Cguide\.ts\)/);
+  assert.match(body, /blob\/abc123def456\/docs\/report%3A2026\)/);
+  assert.doesNotMatch(body, /docs\/report#L2026/);
+  assert.ok(body.includes("[`` `leading.ts ``](https://github.com/OpenCoven/coven-github-webhook/blob/abc123def456/%60leading.ts)"));
+  assert.ok(body.includes("[`` trailing.ts` ``](https://github.com/OpenCoven/coven-github-webhook/blob/abc123def456/trailing.ts%60)"));
+  assert.match(body, /Follow-up evidence is in \[`src\/follow-up\.ts`\]/);
+  assert.match(body, /\[`src\/already\.ts`\]\(https:\/\/example\.com\/already\)/);
+  assert.ok(body.includes("[see `src/mixed.ts`](https://example.com/mixed)"));
+  assert.ok(body.includes("[`src/reference.ts`][source]"));
+  assert.ok(body.includes("[`src/collapsed.ts`][]"));
+  assert.ok(body.includes("[`src/shortcut.ts`]"));
+  assert.ok(body.includes("![see `src/image.ts`](https://example.com/image.png)"));
+  assert.ok(body.includes("[see src/bare-reference.ts][bare-source]"));
+  assert.ok(body.includes("[title](https://example.com/path \"see `src/title.ts`\")"));
+  assert.ok(body.includes("[see ` src/unmatched-label.ts](https://example.com/unmatched-label)"));
+  assert.ok(body.includes("<span data-path=\"src/attribute.ts\">attribute</span>"));
+  assert.ok(body.includes("[source]: src/reference-target.ts"));
+  assert.ok(body.includes("[bare-source]: src/bare-reference.ts"));
+  assert.ok(body.includes("[escaped\\]source]: src/escaped-definition.ts"));
+  assert.ok(body.includes("[multiline-source]:\n  src/multiline-definition.ts\n  \"Optional title\""));
+  assert.ok(body.includes("Plain https://example.com/view?file=src/query.ts#L2"));
+  assert.ok(body.includes("Other URLs ftp://example.com/?file=src/ftp.ts file:///tmp/?file=src/file-url.ts mailto:user@example.com?body=src/mail.ts"));
+  assert.ok(body.includes("Short URI x:foo?path=src/short-scheme.ts and localhost/docs/local.ts"));
+  assert.ok(body.includes("Hostnames www.example.com/docs/www.ts, example.com/docs/domain.ts, www.example.com/?file=src/www-query.ts, example.com/?file=src/domain-query.ts, 192.168.1.2/?file=src/ip-query.ts, [::1]/?file=src/ipv6-query.ts, and //example.com/?file=src/protocol-relative.ts"));
+  assert.ok(body.includes("Assigned URLs url=www.example.com/?file=src/assigned-url.ts and href=https://example.com/?file=src/assigned-href.ts"));
+  assert.ok(body.includes("Emphasized URLs **https://example.com/?file=src/emphasis-bold.ts**, _https://example.com/?file=src/emphasis-underscore.ts_, ~~https://example.com/?file=src/emphasis-strike.ts~~, and **www.example.com/?file=src/emphasis-www.ts**"));
+  assert.match(body, /Emphasized file _\[`src\/lib\/server\/skills-directory\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/lib\/server\/skills-directory\.ts\)_/);
+  assert.ok(body.includes("Escaped backtick \\` [see `src/escaped-prefix.ts`](https://example.com/escaped-prefix)"));
+  assert.match(body, /Backticks in a destination \[x\]\(dest`\) \[`src\/backtick-after-link\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/backtick-after-link\.ts\) `\)/);
+  assert.ok(body.includes("Nested destination [x](foo`(`bar)q=src/backtick-in-link.ts)"));
+  assert.ok(body.includes("Nested leading destination [x](() \"title ) q=src/nested-title.ts\")"));
+  assert.match(body, /Empty destination title \[x\]\( "title \) q=\[`src\/empty-title\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/empty-title\.ts\)"\)/);
+  assert.ok(body.includes("Escaped leading destination [x](\\( \"title ) q=src/escaped-title.ts\")"));
+  assert.match(body, /Sentence final \[`src\/sentence\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/abc123def456\/src\/sentence\.ts\)\./);
+  assert.match(body, /```ts\n`src\/not-linked-after-reference\.ts`\n```/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-after-reference\.ts`\]/);
+  assert.match(body, /After reference fence \[`src\/after-reference\.ts`\]/);
+  assert.doesNotMatch(body, /blob\/abc123def456\/src\/(?:mixed|reference|collapsed|shortcut|image|bare-reference|title|unmatched-label|attribute|reference-target|escaped-definition|multiline-definition|query|ftp|file-url|mail|short-scheme|local|www|domain|www-query|domain-query|ip-query|ipv6-query|protocol-relative|assigned-url|assigned-href|emphasis-bold|emphasis-underscore|emphasis-strike|emphasis-www|escaped-prefix|backtick-in-link|nested-title|escaped-title|not-linked-after-reference)\.ts/);
+  assert.match(body, /`src\/not-linked-inside-fence\.ts`/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-inside-fence\.ts`\]/);
+  assert.match(body, /`src\/not-linked-inside-tilde-fence\.ts`/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-inside-tilde-fence\.ts`\]/);
+  assert.match(body, /`src\/not-linked-inside-long-fence\.ts`/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-inside-long-fence\.ts`\]/);
+  assert.match(body, /    `src\/not-linked-inside-indent\.ts`/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-inside-indent\.ts`\]/);
+  assert.match(body, /\t`src\/not-linked-inside-tab\.ts`/);
+  assert.doesNotMatch(body, /\[`src\/not-linked-inside-tab\.ts`\]/);
+});
+
+test("publication body handles a bounded code span with many backtick runs", () => {
+  const rawCode = `${"a`".repeat(150_000)}x.ts`;
+  assert.doesNotThrow(() => publicationCommentBody(
+    {
+      task_id: "task-many-backticks",
+      repository: "OpenCoven/coven-github-webhook",
+      default_branch: "main",
+      review_evidence: {head_sha: "abc123def456"},
+    },
+    {
+      status: "success",
+      summary: `\`\`${rawCode}\`\``,
+      files_changed: [],
+      commits: [],
+    },
+  ));
+
+  const delimiterHeavy = "a~".repeat(250_000);
+  const started = Date.now();
+  publicationCommentBody(
+    {task_id: "task-many-tildes", repository: "OpenCoven/example", default_branch: "main"},
+    {status: "success", summary: delimiterHeavy, files_changed: [], commits: []},
+  );
+  assert.ok(Date.now() - started < 2_000, "delimiter-heavy publication rendering should remain linear");
+
+  const bracketStarted = Date.now();
+  publicationCommentBody(
+    {task_id: "task-many-brackets", repository: "OpenCoven/example", default_branch: "main"},
+    {status: "success", summary: `${"[".repeat(100_000)}]`, files_changed: [], commits: []},
+  );
+  assert.ok(Date.now() - bracketStarted < 2_000, "unbalanced bracket publication rendering should remain linear");
+
+  const distinctRuns = Array.from({length: 1_000}, (_, index) => `${"`".repeat(index + 1)}a`).join("");
+  const distinctStarted = Date.now();
+  publicationCommentBody(
+    {task_id: "task-distinct-backticks", repository: "OpenCoven/example", default_branch: "main"},
+    {status: "success", summary: distinctRuns, files_changed: [], commits: []},
+  );
+  assert.ok(Date.now() - distinctStarted < 2_000, "distinct unmatched backtick runs should be indexed once");
+
+  const malformedStarted = Date.now();
+  publicationCommentBody(
+    {task_id: "task-malformed-markdown", repository: "OpenCoven/example", default_branch: "main"},
+    {status: "success", summary: `${"<A".repeat(20_000)}${"[x](".repeat(10_000)})`, files_changed: [], commits: []},
+  );
+  assert.ok(Date.now() - malformedStarted < 2_000, "incomplete Markdown constructs should not rescan the remaining body");
+});
+
+test("publication body links structured review file lists and findings", () => {
+  const body = publicationCommentBody(
+    {
+      task_id: "task-structured-links",
+      repository: "OpenCoven/coven-github-webhook",
+      default_branch: "main",
+      review_evidence: {
+        head_sha: "feedface",
+        base_sha: "baseface",
+        merge_base_sha: "mergeface",
+        changed_files: ["src/app.ts", "src/deleted.ts", "src/new.ts"],
+        changed_file_details: [
+          {path: "src/app.ts", status: "modified"},
+          {path: "src/deleted.ts", status: "removed"},
+          {path: "src/new.ts", previous_path: "src/old.ts", status: "renamed"},
+        ],
+        changed_file_count: 3,
+      },
+    },
+    {
+      status: "success",
+      summary: "Done.",
+      review: {
+        mode: "review",
+        evidence_status: "complete",
+        reviewed_files: ["src/app.ts", "src/deleted.ts", "src/new.ts"],
+        supporting_files: ["tests/app.test.ts", "src/old.ts"],
+        findings: [
+          {
+            severity: "medium",
+            file: "src/app.ts",
+            line: 7,
+            title: "Example finding",
+          },
+        ],
+        no_findings_reason: "Checked `tests/app.test.ts` with `npm test`.",
+        tests_run: [
+          {
+            command: "Read src/app.ts",
+            status: "passed",
+            output_summary: "inspected `tests/app.test.ts` coverage.",
+          },
+          {
+            command: "npm test",
+            status: "passed",
+          },
+        ],
+      },
+    },
+  );
+
+  assert.match(body, /\[`src\/app\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/app\.ts\)/);
+  assert.match(body, /\[`src\/deleted\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/mergeface\/src\/deleted\.ts\)/);
+  assert.match(body, /\[`src\/new\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/new\.ts\)/);
+  assert.match(body, /\[`src\/old\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/mergeface\/src\/old\.ts\)/);
+  assert.match(body, /\[`tests\/app\.test\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/tests\/app\.test\.ts\)/);
+  assert.match(body, /\[`src\/app\.ts:7`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/app\.ts#L7\)/);
+  assert.match(body, /`Read` \[`src\/app\.ts`\]\(https:\/\/github\.com\/OpenCoven\/coven-github-webhook\/blob\/feedface\/src\/app\.ts\): `passed`/);
+  assert.match(body, /with `npm test`/);
+  assert.match(body, /- `npm test`: `passed`/);
+});
+
+test("file links prefer the head for rename-and-readd and copied source paths", () => {
+  const body = publicationCommentBody(
+    {
+      task_id: "task-revision-selection",
+      repository: "OpenCoven/example",
+      review_evidence: {
+        head_sha: "headface",
+        base_sha: "baseface",
+        merge_base_sha: "mergeface",
+        changed_files: ["src/new.ts", "src/old.ts", "src/copied.ts", "src/newer.ts"],
+        changed_file_details: [
+          {path: "src/new.ts", previous_path: "src/old.ts", status: "renamed"},
+          {path: "src/old.ts", status: "added"},
+          {path: "src/copied.ts", previous_path: "src/source.ts", status: "copied"},
+          {path: "src/newer.ts", previous_path: "src/legacy.ts", status: "renamed"},
+        ],
+      },
+    },
+    {
+      status: "success",
+      summary: "Done.",
+      review: {supporting_files: ["src/old.ts", "src/source.ts", "src/legacy.ts"]},
+    },
+  );
+
+  assert.match(body, /blob\/headface\/src\/old\.ts/);
+  assert.match(body, /blob\/headface\/src\/source\.ts/);
+  assert.match(body, /blob\/mergeface\/src\/legacy\.ts/);
+});
+
 test("routing enforces exact enabled event actions before spending compute", async () => {
   const secret = "enabled-trigger-secret";
   const stateDir = tempStateDir();
@@ -2204,11 +2547,14 @@ test("near-limit inline fallback preserves a complete trusted marker and remains
   const stateDir = tempStateDir();
   const config = testConfig(stateDir);
   const task = reviewTask("near-limit-inline-fallback");
+  const maximumBaseRef = "b".repeat(128);
+  (task.review_evidence as JsonObject).base_sha = maximumBaseRef;
+  task.created_at = "2026-07-14T12:00:00.000Z";
   prepareReviewWorkspace(config, task);
   const result = completeReview([{
     severity: "high", file: "src/app.ts", line: 12, title: "Finding", body: "Body", recommendation: null,
   }]);
-  result.summary = "x".repeat(59_500);
+  result.summary = Array.from({length: 900}, () => "`src/app.ts`").join(" ");
   const resultPath = join(stateDir, "near-limit-result.json");
   writeFileSync(resultPath, JSON.stringify(result));
   let publishedBody = "";
@@ -2216,7 +2562,7 @@ test("near-limit inline fallback preserves a complete trusted marker and remains
   let reviewPosts = 0;
   let submissions = 0;
   await withGithubApiMock((url, init) => {
-    if (/\/pulls\/7$/.test(url)) return {head: {sha: "abc123"}, base: {sha: "base123"}};
+    if (/\/pulls\/7$/.test(url)) return {head: {sha: "abc123"}, base: {sha: maximumBaseRef}};
     if (init.method === "GET" && /\/pulls\/7\/reviews\/4021$/.test(url)) {
       return {id: 4021, state: reviewState, commit_id: "abc123", body: publishedBody, html_url: "https://github.com/OpenCoven/example/pull/7#pullrequestreview-4021", user: covencatBot()};
     }
@@ -2253,7 +2599,8 @@ test("near-limit inline fallback preserves a complete trusted marker and remains
   assert.equal(submissions, 1);
   assert.ok(publishedBody.length <= 60_000);
   assert.match(publishedBody, /Inline publication was unavailable/);
-  assert.match(publishedBody, /<!-- covencat-publication:[a-f0-9]{64} -->\n<!-- covencat-review-base:base123 -->\n<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
+  assert.doesNotMatch(publishedBody.slice(0, publishedBody.indexOf("<!-- covencat-publication:")), /\]\([^)]*$/);
+  assert.match(publishedBody, new RegExp(`<!-- covencat-publication:[a-f0-9]{64} -->\\n<!-- covencat-task-created:2026-07-14T12:00:00.000Z -->\\n<!-- covencat-review-base:${maximumBaseRef} -->\\n<!-- covencat-publication-proof:[a-f0-9]{64} -->$`));
   assert.equal(task.publication_state, "publication_skipped_duplicate", String(task.publication_error || ""));
 });
 
@@ -3431,6 +3778,21 @@ test("redacts credentials and passes only allowlisted ambient environment keys",
   ].join("\n");
   const redacted = redactTokenish(secretText);
   assert.doesNotMatch(redacted, /1234567890|topsecret|password|private-data|eyJabc|reviewer@example\.com|reviewer \(/);
+  const longPlainText = "x".repeat(80_000);
+  const redactionStarted = Date.now();
+  assert.equal(redactTokenish(longPlainText), longPlainText);
+  assert.ok(Date.now() - redactionStarted < 1_000, "redaction should remain linear on long non-email text");
+  const diagnosticStarted = Date.now();
+  assert.equal(runtimeDiagnostic({
+    args: ["coven-code"], returncode: 1, stdout: "", stderr: longPlainText,
+    signal: null, timed_out: false, duration_ms: 1, stdout_truncated: false,
+    stderr_truncated: false, output_limit_bytes: 100_000, spawn_error: "",
+  }), longPlainText.slice(0, 1_000));
+  assert.ok(Date.now() - diagnosticStarted < 1_000, "runtime diagnostics should reuse linear credential redaction");
+  const unmatchedPrivateKeyHeaders = "-----BEGIN PRIVATE KEY-----\n".repeat(12_000);
+  const privateKeyStarted = Date.now();
+  assert.equal(redactTokenish(unmatchedPrivateKeyHeaders), unmatchedPrivateKeyHeaders);
+  assert.ok(Date.now() - privateKeyStarted < 1_000, "unterminated private-key headers should be scanned once");
   const artifact = redactedCommandResult({
     args: ["git", "-c", "user.email=covencat[bot]@users.noreply.github.com", "https://x-access-token:ghs_1234567890@github.com/OpenCoven/example.git"],
     returncode: 1,
@@ -3568,6 +3930,185 @@ test("keeps idempotency marker after truncating and redacts issue publication te
   assert.match(body, /<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
   assert.doesNotMatch(body, /ghs_1234567890/);
   assert.ok(body.length < 60_000);
+});
+
+test("truncates publication output only between complete generated Markdown links", async () => {
+  const stateDir = tempStateDir();
+  const task: JsonObject = {
+    task_id: "long-linked-issue",
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    task: {issue_number: 13},
+    review_evidence: {
+      head_sha: "headface",
+      changed_files: ["src/app.ts"],
+      changed_file_details: [{path: "src/app.ts", status: "modified"}],
+    },
+  };
+  const resultPath = join(stateDir, "result.json");
+  const repeatedLinks = Array.from({length: 6_000}, () => "`src/app.ts`").join(" ");
+  writeFileSync(resultPath, JSON.stringify({status: "success", summary: repeatedLinks, pr_body: "", files_changed: [], commits: []}));
+  let body = "";
+  await withGithubApiMock((_url, init) => {
+    if (init.method === "GET") return [];
+    body = String((JSON.parse(String(init.body)) as JsonObject).body);
+    return {id: 410, html_url: "https://github.com/OpenCoven/example/issues/13#issuecomment-410"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+  const markerStart = body.indexOf("<!-- covencat-publication:");
+  const publishedMarkdown = body.slice(0, markerStart).trimEnd();
+  assert.ok(markerStart > 0);
+  assert.ok(body.length <= 60_000);
+  assert.match(publishedMarkdown, /Review output truncated/);
+  assert.doesNotMatch(publishedMarkdown, /\[[^\]]*$/);
+  assert.doesNotMatch(publishedMarkdown, /\]\([^)]*$/);
+  assert.equal((publishedMarkdown.match(/`/g) || []).length % 2, 0);
+  assert.match(publishedMarkdown, /\[`src\/app\.ts`\]\(https:\/\/github\.com\/OpenCoven\/example\/blob\/headface\/src\/app\.ts\)/);
+  assert.match(body, /<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
+});
+
+test("truncates unmatched Markdown brackets without repeatedly rescanning the body", async () => {
+  const stateDir = tempStateDir();
+  const task: JsonObject = {
+    task_id: "unmatched-bracket-issue",
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    task: {issue_number: 14},
+  };
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify({status: "success", summary: `[${"`".repeat(58_000)}${"x".repeat(7_000)}`, files_changed: [], commits: []}));
+  let body = "";
+  const started = Date.now();
+  await withGithubApiMock((_url, init) => {
+    if (init.method === "GET") return [];
+    body = String((JSON.parse(String(init.body)) as JsonObject).body);
+    return {id: 411, html_url: "https://github.com/OpenCoven/example/issues/14#issuecomment-411"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+  assert.ok(Date.now() - started < 2_000, "publication should remain linear for unmatched Markdown labels");
+  assert.ok(body.length > 59_000, "an unmatched literal delimiter should not discard the available publication budget");
+  assert.match(body, /Review output truncated/);
+  assert.match(body, /<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
+});
+
+test("keeps an angle-bracket link destination whole at the publication limit", async () => {
+  const stateDir = tempStateDir();
+  const task: JsonObject = {
+    task_id: "angle-link-limit-issue",
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    task: {issue_number: 15},
+  };
+  const resultPath = join(stateDir, "result.json");
+  const angleLink = "[source](<https://example.com/a)b>)";
+  writeFileSync(resultPath, JSON.stringify({
+    status: "success",
+    summary: `${"x".repeat(59_580)}${angleLink}${"z".repeat(1_000)}`,
+    files_changed: [],
+    commits: [],
+  }));
+  let body = "";
+  await withGithubApiMock((_url, init) => {
+    if (init.method === "GET") return [];
+    body = String((JSON.parse(String(init.body)) as JsonObject).body);
+    return {id: 412, html_url: "https://github.com/OpenCoven/example/issues/15#issuecomment-412"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+  assert.match(body, /Review output truncated/);
+  assert.ok(!body.includes("[source]") || body.includes(angleLink));
+  assert.doesNotMatch(body.slice(0, body.indexOf("<!-- covencat-publication:")), /\[[^\]]*$|\]\([^)]*$/);
+});
+
+test("keeps a later autolink whole after an unmatched angle on an earlier line", async () => {
+  const stateDir = tempStateDir();
+  const task: JsonObject = {
+    task_id: "unmatched-angle-before-autolink",
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    task: {issue_number: 16},
+  };
+  const resultPath = join(stateDir, "result.json");
+  const autolink = `<https://example.com/${"y".repeat(1_000)}>`;
+  writeFileSync(resultPath, JSON.stringify({
+    status: "success",
+    summary: `<A\n${"x".repeat(59_550)}${autolink}`,
+    files_changed: [],
+    commits: [],
+  }));
+  let body = "";
+  await withGithubApiMock((_url, init) => {
+    if (init.method === "GET") return [];
+    body = String((JSON.parse(String(init.body)) as JsonObject).body);
+    return {id: 413, html_url: "https://github.com/OpenCoven/example/issues/16#issuecomment-413"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+  const publishedMarkdown = body.slice(0, body.indexOf("<!-- covencat-publication:"));
+  assert.match(body, /Review output truncated/);
+  assert.ok(!publishedMarkdown.includes("<https://example.com/") || publishedMarkdown.includes(autolink));
+  assert.match(body, /<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
+});
+
+test("truncates before complete backtick and tilde fenced blocks", async () => {
+  for (const [name, opener, closer] of [
+    ["backtick", "````ts", "`````"],
+    ["tilde", "~~~~ts", "~~~~~"],
+  ] as const) {
+    const stateDir = tempStateDir();
+    const task: JsonObject = {
+      task_id: `${name}-fence-limit`,
+      repository: "OpenCoven/example",
+      publication: {mode: "comment"},
+      task: {issue_number: 17},
+    };
+    const resultPath = join(stateDir, "result.json");
+    const fencedBlock = `${opener}\n[label\n\`\`\`\n]\n${"y".repeat(1_000)}\n${closer}`;
+    writeFileSync(resultPath, JSON.stringify({
+      status: "success",
+      summary: `${"x".repeat(59_550)}\n${fencedBlock}\ntail`,
+      files_changed: [],
+      commits: [],
+    }));
+    let body = "";
+    await withGithubApiMock((_url, init) => {
+      if (init.method === "GET") return [];
+      body = String((JSON.parse(String(init.body)) as JsonObject).body);
+      return {id: 414, html_url: "https://github.com/OpenCoven/example/issues/17#issuecomment-414"};
+    }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+    const publishedMarkdown = body.slice(0, body.indexOf("<!-- covencat-publication:"));
+    assert.match(body, /Review output truncated/);
+    assert.ok(!publishedMarkdown.includes(opener) || publishedMarkdown.includes(fencedBlock));
+    assert.match(body, /<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
+  }
+});
+
+test("truncates repeated incomplete inline links without rescanning the suffix", async () => {
+  const stateDir = tempStateDir();
+  const task: JsonObject = {
+    task_id: "incomplete-inline-links-limit",
+    repository: "OpenCoven/example",
+    publication: {mode: "comment"},
+    task: {issue_number: 18},
+  };
+  const resultPath = join(stateDir, "result.json");
+  writeFileSync(resultPath, JSON.stringify({
+    status: "success",
+    summary: `${"[x](".repeat(10_000)})${"z".repeat(60_000)}`,
+    files_changed: [],
+    commits: [],
+  }));
+  let body = "";
+  const started = Date.now();
+  await withGithubApiMock((_url, init) => {
+    if (init.method === "GET") return [];
+    body = String((JSON.parse(String(init.body)) as JsonObject).body);
+    return {id: 415, html_url: "https://github.com/OpenCoven/example/issues/18#issuecomment-415"};
+  }, async () => publishResultIfConfigured(testConfig(stateDir), task, resultPath, "token"));
+
+  assert.ok(Date.now() - started < 2_000, "incomplete inline links should be indexed once during truncation");
+  assert.ok(body.length > 59_000, "malformed link syntax should not discard the available publication budget");
+  assert.match(body, /Review output truncated/);
+  assert.match(body, /<!-- covencat-publication-proof:[a-f0-9]{64} -->$/);
 });
 
 test("concurrent signed deliveries initialize one task without overwriting the winner", async () => {

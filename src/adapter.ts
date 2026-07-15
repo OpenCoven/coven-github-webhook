@@ -3026,6 +3026,7 @@ export function summarizePrFiles(files: JsonObject[], localPatches?: ReadonlyMap
     const binaryPatch = /(?:^|\n)(?:GIT binary patch|Binary files .+ differ)(?:\n|$)/.test(patch);
     return {
       filename,
+      previous_filename: item.previous_filename,
       status: item.status,
       additions: item.additions,
       deletions: item.deletions,
@@ -3074,6 +3075,11 @@ function reviewEvidence(reviewContext: JsonObject, reviewContextPath: string, ta
     changed_file_count: files.length,
     expected_changed_file_count: metadata.changed_files,
     changed_files: files.map((file) => file.filename).filter((file): file is JsonValue => file !== undefined),
+    changed_file_details: files.map((file) => ({
+      path: file.filename,
+      previous_path: file.previous_filename,
+      status: file.status,
+    })),
     changed_file_lines: files.map((file) => ({path: file.filename, ...patchDiffLines(String(file.patch || ""))})),
     incomplete_patch_files: files
       .filter((file) => file.patch_truncated === true || !String(file.patch || "").trim())
@@ -3515,6 +3521,606 @@ function safePublicationText(value: string, maxLength = 60_000): string {
   return redactTokenish(value).slice(0, maxLength);
 }
 
+function markdownCodeSpanEnd(value: string, start: number, limit = value.length): number | null {
+  let openingEnd = start;
+  while (openingEnd < limit && value[openingEnd] === "`") openingEnd += 1;
+  const delimiterLength = openingEnd - start;
+  let cursor = openingEnd;
+  while (cursor < limit) {
+    if (value[cursor] !== "`") {
+      cursor += 1;
+      continue;
+    }
+    let runEnd = cursor;
+    while (runEnd < limit && value[runEnd] === "`") runEnd += 1;
+    if (runEnd - cursor === delimiterLength) return runEnd;
+    cursor = runEnd;
+  }
+  return null;
+}
+
+interface MarkdownBacktickSpans {
+  starts: number[];
+  ends: number[];
+}
+
+function markdownFenceSpans(value: string): MarkdownBacktickSpans {
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let active: {start: number; marker: "`" | "~"; length: number} | null = null;
+  let lineStart = 0;
+  while (lineStart <= value.length) {
+    const newline = value.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? value.length : newline;
+    const line = value.slice(lineStart, lineEnd).replace(/\r$/, "");
+    if (active) {
+      const closing = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+      if (closing && closing[1][0] === active.marker && closing[1].length >= active.length) {
+        starts.push(active.start);
+        ends.push(newline < 0 ? lineEnd : newline + 1);
+        active = null;
+      }
+    } else {
+      const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+      if (opening) active = {start: lineStart, marker: opening[1][0] as "`" | "~", length: opening[1].length};
+    }
+    if (newline < 0) break;
+    lineStart = newline + 1;
+  }
+  if (active) {
+    starts.push(active.start);
+    ends.push(value.length);
+  }
+  return {starts, ends};
+}
+
+function markdownBacktickSpans(value: string, fenceSpans: MarkdownBacktickSpans = markdownFenceSpans(value)): MarkdownBacktickSpans {
+  const runStarts: number[] = [];
+  const runEnds: number[] = [];
+  const runLengths: number[] = [];
+  const runEscaped: boolean[] = [];
+  let cursor = 0;
+  let nextFence = 0;
+  while (cursor < value.length) {
+    const start = value.indexOf("`", cursor);
+    if (start < 0) break;
+    while (nextFence < fenceSpans.starts.length && fenceSpans.ends[nextFence] <= start) nextFence += 1;
+    if (nextFence < fenceSpans.starts.length && fenceSpans.starts[nextFence] <= start && start < fenceSpans.ends[nextFence]) {
+      cursor = fenceSpans.ends[nextFence];
+      continue;
+    }
+    let end = start + 1;
+    while (value[end] === "`") end += 1;
+    let escapeCursor = start - 1;
+    let escapeCount = 0;
+    while (escapeCursor >= 0 && value[escapeCursor] === "\\") {
+      escapeCount += 1;
+      escapeCursor -= 1;
+    }
+    runStarts.push(start);
+    runEnds.push(end);
+    runLengths.push(end - start);
+    runEscaped.push(escapeCount % 2 === 1);
+    cursor = end;
+  }
+
+  const nextSame = new Int32Array(runStarts.length);
+  nextSame.fill(-1);
+  const nextByLength = new Map<number, number>();
+  for (let index = runStarts.length - 1; index >= 0; index -= 1) {
+    nextSame[index] = nextByLength.get(runLengths[index]) ?? -1;
+    nextByLength.set(runLengths[index], index);
+  }
+
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (let index = 0; index < runStarts.length;) {
+    if (runEscaped[index]) {
+      index += 1;
+      continue;
+    }
+    const closing = nextSame[index];
+    if (closing >= 0) {
+      starts.push(runStarts[index]);
+      ends.push(runEnds[closing]);
+      index = closing + 1;
+    } else {
+      index += 1;
+    }
+  }
+  return {starts, ends};
+}
+
+function indexedBacktickSpanEnd(spans: MarkdownBacktickSpans, start: number): number | null {
+  let low = 0;
+  let high = spans.starts.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >>> 1;
+    if (spans.starts[middle] === start) return spans.ends[middle];
+    if (spans.starts[middle] < start) low = middle + 1;
+    else high = middle - 1;
+  }
+  return null;
+}
+
+function markdownBracketEnd(
+  value: string,
+  start: number,
+  limit = value.length,
+  backtickSpans?: MarkdownBacktickSpans,
+): number | null {
+  let depth = 0;
+  let cursor = start;
+  while (cursor < limit) {
+    if (value[cursor] === "\\") {
+      cursor = Math.min(limit, cursor + 2);
+      continue;
+    }
+    if (value[cursor] === "`") {
+      const codeEnd = backtickSpans ? indexedBacktickSpanEnd(backtickSpans, cursor) : markdownCodeSpanEnd(value, cursor, limit);
+      if (codeEnd !== null && codeEnd <= limit) {
+        cursor = codeEnd;
+        continue;
+      }
+      if (codeEnd !== null && codeEnd > limit) return null;
+      while (cursor < limit && value[cursor] === "`") cursor += 1;
+      continue;
+    }
+    if (value[cursor] === "[") depth += 1;
+    if (value[cursor] === "]") {
+      depth -= 1;
+      if (depth === 0) return cursor + 1;
+    }
+    cursor += 1;
+  }
+  return null;
+}
+
+function markdownParenthesizedEnd(value: string, start: number, limit = value.length): number | null {
+  let depth = 0;
+  let angleDestination = false;
+  let destinationStarted = false;
+  let destinationComplete = false;
+  let quotedTitle: "\"" | "'" | null = null;
+  let cursor = start;
+  while (cursor < limit) {
+    if (value[cursor] === "\\") {
+      cursor = Math.min(limit, cursor + 2);
+      continue;
+    }
+    if (quotedTitle) {
+      if (value[cursor] === quotedTitle) quotedTitle = null;
+      cursor += 1;
+      continue;
+    }
+    if (angleDestination) {
+      if (value[cursor] === ">") {
+        angleDestination = false;
+        destinationComplete = true;
+      }
+      cursor += 1;
+      continue;
+    }
+    if (depth === 1 && destinationComplete && (value[cursor] === "\"" || value[cursor] === "'")) {
+      quotedTitle = value[cursor] as "\"" | "'";
+      cursor += 1;
+      continue;
+    }
+    if (value[cursor] === "(") depth += 1;
+    if (value[cursor] === ")") {
+      depth -= 1;
+      if (depth === 0) return cursor + 1;
+    }
+    if (depth === 1 && cursor > start) {
+      if (!destinationStarted && /\s/.test(value[cursor])) {
+        cursor += 1;
+        continue;
+      }
+      if (!destinationStarted) {
+        destinationStarted = true;
+        if (value[cursor] === "<") angleDestination = true;
+      } else if (/\s/.test(value[cursor])) {
+        destinationComplete = true;
+      }
+    }
+    cursor += 1;
+  }
+  return null;
+}
+
+function markdownFenceEnd(value: string, start: number, limit = value.length): number | null | undefined {
+  if (value[start] !== "`" && value[start] !== "~") return undefined;
+  let prefix = start - 1;
+  let indentation = 0;
+  while (prefix >= 0 && value[prefix] === " " && indentation < 4) {
+    prefix -= 1;
+    indentation += 1;
+  }
+  if (indentation > 3 || (prefix >= 0 && value[prefix] !== "\n")) return undefined;
+  let openingEnd = start;
+  while (openingEnd < limit && value[openingEnd] === value[start]) openingEnd += 1;
+  const markerLength = openingEnd - start;
+  if (markerLength < 3) return undefined;
+  const openingLineEnd = value.indexOf("\n", openingEnd);
+  if (openingLineEnd < 0 || openingLineEnd >= limit) return null;
+
+  let cursor = openingLineEnd + 1;
+  while (cursor <= limit) {
+    const newline = value.indexOf("\n", cursor);
+    if (newline > limit || (newline < 0 && limit < value.length)) return null;
+    const lineEnd = newline < 0 ? value.length : newline;
+    const line = value.slice(cursor, lineEnd).replace(/\r$/, "");
+    const closing = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+    if (closing && closing[1][0] === value[start] && closing[1].length >= markerLength) {
+      return newline < 0 || newline >= limit ? lineEnd : newline + 1;
+    }
+    if (newline < 0 || newline >= limit) break;
+    cursor = newline + 1;
+  }
+  return null;
+}
+
+function markdownAngleEnd(value: string, start: number, limit = value.length): number | null | undefined {
+  if (value[start] !== "<" || !/[A-Za-z/!?]/.test(value[start + 1] || "")) return undefined;
+  let quote: "\"" | "'" | null = null;
+  let cursor = start + 1;
+  while (cursor < limit) {
+    if (quote) {
+      if (value[cursor] === quote) quote = null;
+      cursor += 1;
+      continue;
+    }
+    if (value[cursor] === "\"" || value[cursor] === "'") {
+      quote = value[cursor] as "\"" | "'";
+      cursor += 1;
+      continue;
+    }
+    if (value[cursor] === ">") return cursor + 1;
+    if (value[cursor] === "\n" || value[cursor] === "\r") return null;
+    cursor += 1;
+  }
+  return null;
+}
+
+function markdownAtomicEnd(
+  value: string,
+  start: number,
+  limit: number,
+  backtickSpans?: MarkdownBacktickSpans,
+  bracketPairs?: Map<number, number>,
+  parenthesisPairs?: Map<number, number>,
+): number | null {
+  const fenceEnd = markdownFenceEnd(value, start, limit);
+  if (fenceEnd !== undefined) return fenceEnd;
+  const angleEnd = markdownAngleEnd(value, start, limit);
+  if (angleEnd !== undefined) return angleEnd;
+  if (value[start] === "`") {
+    const indexedEnd = backtickSpans ? indexedBacktickSpanEnd(backtickSpans, start) : markdownCodeSpanEnd(value, start, limit);
+    return indexedEnd !== null && indexedEnd <= limit ? indexedEnd : null;
+  }
+  const labelStart = value[start] === "!" && value[start + 1] === "[" ? start + 1 : start;
+  if (value[labelStart] !== "[") return start + (Number(value.codePointAt(start)) > 0xFFFF ? 2 : 1);
+  const pairedBracketEnd = bracketPairs?.get(labelStart);
+  const labelEnd = pairedBracketEnd !== undefined
+    ? (pairedBracketEnd <= limit ? pairedBracketEnd : null)
+    : markdownBracketEnd(value, labelStart, limit, backtickSpans);
+  if (labelEnd === null) return null;
+  if (labelEnd < value.length && value[labelEnd] === "(") {
+    if (parenthesisPairs) {
+      const parenthesizedEnd = parenthesisPairs.get(labelEnd);
+      if (parenthesizedEnd === undefined) return labelEnd;
+      return parenthesizedEnd <= limit ? parenthesizedEnd : null;
+    }
+    return markdownParenthesizedEnd(value, labelEnd, limit);
+  }
+  if (labelEnd < limit && value[labelEnd] === "[") {
+    const pairedReferenceEnd = bracketPairs?.get(labelEnd);
+    return pairedReferenceEnd !== undefined
+      ? (pairedReferenceEnd <= limit ? pairedReferenceEnd : null)
+      : markdownBracketEnd(value, labelEnd, limit, backtickSpans);
+  }
+  return labelEnd;
+}
+
+interface MarkdownLinkDestinationState {
+  start: number;
+  destinationStarted: boolean;
+  destinationComplete: boolean;
+  angleDestination: boolean;
+  quotedTitle: "\"" | "'" | null;
+}
+
+function markdownParenthesisPairs(
+  value: string,
+  backtickSpans: MarkdownBacktickSpans,
+  fenceSpans: MarkdownBacktickSpans,
+  bracketPairs: Map<number, number>,
+): Map<number, number> {
+  const linkOpeners = new Set<number>();
+  for (const labelEnd of bracketPairs.values()) {
+    if (value[labelEnd] === "(") linkOpeners.add(labelEnd);
+  }
+
+  const pairs = new Map<number, number>();
+  // Keep nested balancing compact: negative entries are link openers and
+  // positive entries are ordinary parentheses, both encoded as offset + 1.
+  const stack: number[] = [];
+  let activeLink: MarkdownLinkDestinationState | null = null;
+  let cursor = 0;
+  let nextFence = 0;
+  while (cursor < value.length) {
+    if (value[cursor] === "\\") {
+      if (activeLink && Math.abs(stack.at(-1) || 0) - 1 === activeLink.start && !activeLink.destinationStarted) {
+        activeLink.destinationStarted = true;
+      }
+      cursor = Math.min(value.length, cursor + 2);
+      continue;
+    }
+    if (activeLink?.quotedTitle) {
+      if (value[cursor] === activeLink.quotedTitle) activeLink.quotedTitle = null;
+      cursor += 1;
+      continue;
+    }
+    if (activeLink?.angleDestination) {
+      if (value[cursor] === ">") {
+        activeLink.angleDestination = false;
+        activeLink.destinationComplete = true;
+      }
+      cursor += 1;
+      continue;
+    }
+
+    if (!activeLink) {
+      while (nextFence < fenceSpans.starts.length && fenceSpans.ends[nextFence] <= cursor) nextFence += 1;
+      if (nextFence < fenceSpans.starts.length && fenceSpans.starts[nextFence] <= cursor && cursor < fenceSpans.ends[nextFence]) {
+        cursor = fenceSpans.ends[nextFence];
+        continue;
+      }
+      if (value[cursor] === "`") {
+        const codeEnd = indexedBacktickSpanEnd(backtickSpans, cursor);
+        if (codeEnd !== null) {
+          cursor = codeEnd;
+          continue;
+        }
+        while (cursor < value.length && value[cursor] === "`") cursor += 1;
+        continue;
+      }
+    }
+
+    const activeAtTopLevel = activeLink !== null && Math.abs(stack.at(-1) || 0) - 1 === activeLink.start;
+    if (
+      activeLink
+      && activeAtTopLevel
+      && activeLink.destinationComplete
+      && (value[cursor] === "\"" || value[cursor] === "'")
+    ) {
+      activeLink.quotedTitle = value[cursor] as "\"" | "'";
+      cursor += 1;
+      continue;
+    }
+    if (value[cursor] === "(") {
+      const isLinkOpener = linkOpeners.has(cursor);
+      if (!activeLink && !isLinkOpener) {
+        cursor += 1;
+        continue;
+      }
+      const startsLinkDestination = activeLink === null;
+      stack.push(isLinkOpener ? -(cursor + 1) : cursor + 1);
+      if (startsLinkDestination) activeLink = {
+        start: cursor,
+        destinationStarted: false,
+        destinationComplete: false,
+        angleDestination: false,
+        quotedTitle: null,
+      };
+      cursor += 1;
+      continue;
+    }
+    if (value[cursor] === ")") {
+      const encodedStart = stack.pop();
+      if (encodedStart !== undefined) {
+        const start = Math.abs(encodedStart) - 1;
+        if (encodedStart < 0) pairs.set(start, cursor + 1);
+        if (activeLink?.start === start) {
+          activeLink = null;
+        } else if (activeLink && Math.abs(stack.at(-1) || 0) - 1 === activeLink.start && !activeLink.destinationStarted) {
+          activeLink.destinationStarted = true;
+        }
+      }
+      cursor += 1;
+      continue;
+    }
+    if (activeAtTopLevel && activeLink) {
+      if (!activeLink.destinationStarted && /\s/.test(value[cursor])) {
+        cursor += 1;
+        continue;
+      }
+      if (!activeLink.destinationStarted) {
+        activeLink.destinationStarted = true;
+        if (value[cursor] === "<") activeLink.angleDestination = true;
+      } else if (/\s/.test(value[cursor])) {
+        activeLink.destinationComplete = true;
+      }
+    }
+    cursor += Number(value.codePointAt(cursor)) > 0xFFFF ? 2 : 1;
+  }
+  return pairs;
+}
+
+function markdownBracketPairs(
+  value: string,
+  backtickSpans: MarkdownBacktickSpans,
+  fenceSpans: MarkdownBacktickSpans,
+): Map<number, number> {
+  const stack: number[] = [];
+  const matched = new Map<number, number>();
+  let cursor = 0;
+  let nextFence = 0;
+  while (cursor < value.length) {
+    while (nextFence < fenceSpans.starts.length && fenceSpans.ends[nextFence] <= cursor) nextFence += 1;
+    if (nextFence < fenceSpans.starts.length && fenceSpans.starts[nextFence] <= cursor && cursor < fenceSpans.ends[nextFence]) {
+      cursor = fenceSpans.ends[nextFence];
+      continue;
+    }
+    if (value[cursor] === "\\") {
+      cursor = Math.min(value.length, cursor + 2);
+      continue;
+    }
+    if (value[cursor] === "`") {
+      const codeEnd = indexedBacktickSpanEnd(backtickSpans, cursor);
+      if (codeEnd !== null) {
+        cursor = codeEnd;
+        continue;
+      }
+      while (cursor < value.length && value[cursor] === "`") cursor += 1;
+      continue;
+    }
+    if (value[cursor] === "[") stack.push(cursor);
+    if (value[cursor] === "]" && stack.length) matched.set(stack.pop() as number, cursor + 1);
+    cursor += 1;
+  }
+  return matched;
+}
+
+function markdownSafePrefix(value: string, maxLength: number): string {
+  let cursor = 0;
+  let safeEnd = 0;
+  const fenceSpans = markdownFenceSpans(value);
+  const backtickSpans = markdownBacktickSpans(value, fenceSpans);
+  const bracketPairs = markdownBracketPairs(value, backtickSpans, fenceSpans);
+  const parenthesisPairs = markdownParenthesisPairs(value, backtickSpans, fenceSpans, bracketPairs);
+  let ignoreUnmatchedAnglesUntil = -1;
+  while (cursor < value.length && cursor < maxLength) {
+    const labelStart = value[cursor] === "!" && value[cursor + 1] === "[" ? cursor + 1 : cursor;
+    const labelEnd = bracketPairs.get(labelStart);
+    if (value[labelStart] === "[" && labelEnd === undefined) {
+      cursor += 1;
+      safeEnd = cursor;
+      continue;
+    }
+    if (value[cursor] === "<" && cursor < ignoreUnmatchedAnglesUntil) {
+      cursor += 1;
+      safeEnd = cursor;
+      continue;
+    }
+    const end = markdownAtomicEnd(value, cursor, maxLength, backtickSpans, bracketPairs, parenthesisPairs);
+    if (end === null) {
+      const fullEnd = markdownAtomicEnd(value, cursor, value.length, backtickSpans, bracketPairs, parenthesisPairs);
+      if (fullEnd !== null) break;
+      const fenceEnd = markdownFenceEnd(value, cursor, value.length);
+      if (fenceEnd === null) break;
+      if (markdownAngleEnd(value, cursor, value.length) === null) {
+        const newline = value.indexOf("\n", cursor);
+        ignoreUnmatchedAnglesUntil = newline < 0 ? value.length : newline + 1;
+      }
+      if (value[cursor] === "`") {
+        while (cursor < maxLength && value[cursor] === "`") cursor += 1;
+      } else {
+        cursor += Number(value.codePointAt(cursor)) > 0xFFFF ? 2 : 1;
+      }
+      safeEnd = cursor;
+      continue;
+    }
+    if (end > maxLength) break;
+    cursor = end;
+    safeEnd = end;
+  }
+  return value.slice(0, safeEnd);
+}
+
+function markdownProtectedRanges(value: string): Array<{start: number; end: number}> {
+  const ranges: Array<{start: number; end: number}> = [];
+  let cursor = 0;
+  const fenceSpans = markdownFenceSpans(value);
+  const backtickSpans = markdownBacktickSpans(value, fenceSpans);
+  const bracketPairs = markdownBracketPairs(value, backtickSpans, fenceSpans);
+  const parenthesisPairs = markdownParenthesisPairs(value, backtickSpans, fenceSpans, bracketPairs);
+  while (cursor < value.length) {
+    const ordinaryEnd = cursor + (Number(value.codePointAt(cursor)) > 0xFFFF ? 2 : 1);
+    const labelStart = value[cursor] === "!" && value[cursor + 1] === "[" ? cursor + 1 : cursor;
+    const labelEnd = bracketPairs.get(labelStart);
+    if (value[labelStart] === "[" && labelEnd === undefined) {
+      cursor = ordinaryEnd;
+      continue;
+    }
+    const end = markdownAtomicEnd(value, cursor, value.length, backtickSpans, bracketPairs, parenthesisPairs);
+    if (end === null) {
+      const fenceEnd = markdownFenceEnd(value, cursor, value.length);
+      if (fenceEnd === null) {
+        ranges.push({start: cursor, end: value.length});
+        break;
+      }
+      if ((labelEnd !== undefined && value[labelEnd] === "(") || markdownAngleEnd(value, cursor, value.length) === null) {
+        ranges.push({start: cursor, end: value.length});
+        break;
+      }
+      if (value[cursor] === "`") {
+        while (cursor < value.length && value[cursor] === "`") cursor += 1;
+      } else {
+        cursor = ordinaryEnd;
+      }
+      continue;
+    }
+    if (end > ordinaryEnd || value[cursor] === "`" || value[cursor] === "[") {
+      ranges.push({start: cursor, end});
+    }
+    cursor = end;
+  }
+  return ranges;
+}
+
+function markdownLinkRanges(value: string): Array<{start: number; end: number}> {
+  const ranges: Array<{start: number; end: number}> = [];
+  const fenceSpans = markdownFenceSpans(value);
+  const backtickSpans = markdownBacktickSpans(value, fenceSpans);
+  const bracketPairs = markdownBracketPairs(value, backtickSpans, fenceSpans);
+  const parenthesisPairs = markdownParenthesisPairs(value, backtickSpans, fenceSpans, bracketPairs);
+  let cursor = 0;
+  while (cursor < value.length) {
+    if (value[cursor] === "\\") {
+      cursor = Math.min(value.length, cursor + 2);
+      continue;
+    }
+    if (value[cursor] === "`") {
+      const codeEnd = indexedBacktickSpanEnd(backtickSpans, cursor);
+      if (codeEnd === null) {
+        while (cursor < value.length && value[cursor] === "`") cursor += 1;
+        continue;
+      }
+      cursor = codeEnd;
+      continue;
+    }
+    const isBracketConstruct = value[cursor] === "[" || (value[cursor] === "!" && value[cursor + 1] === "[");
+    const isAngleConstruct = markdownAngleEnd(value, cursor) !== undefined;
+    if (isBracketConstruct || isAngleConstruct) {
+      const end = markdownAtomicEnd(value, cursor, value.length, backtickSpans, bracketPairs, parenthesisPairs);
+      if (end === null) {
+        ranges.push({start: cursor, end: value.length});
+        break;
+      }
+      ranges.push({start: cursor, end});
+      cursor = end;
+      continue;
+    }
+    cursor += Number(value.codePointAt(cursor)) > 0xFFFF ? 2 : 1;
+  }
+  return ranges;
+}
+
+function safeMarkdownPublicationText(value: string, maxLength = 60_000): string {
+  const safeValue = redactTokenish(value);
+  if (safeValue.length <= maxLength) return safeValue;
+  const notice = "\n\n_Review output truncated to fit GitHub's publication limit._";
+  const prefix = markdownSafePrefix(safeValue, Math.max(0, maxLength - notice.length)).trimEnd();
+  return prefix ? `${prefix}${notice}` : notice.trim().slice(0, maxLength);
+}
+
+function publicationBodyWithMarker(markdown: string, marker: string, maxLength = 60_000): string {
+  const separator = "\n\n";
+  const contentBudget = Math.max(0, Math.min(59_700, maxLength - separator.length - marker.length));
+  return `${safeMarkdownPublicationText(markdown, contentBudget)}${separator}${marker}`;
+}
+
 function safeReviewNotice(body: string, notice: string, maxLength = 60_000): string {
   const safeBody = redactTokenish(body);
   const safeNotice = redactTokenish(notice).trim();
@@ -3524,7 +4130,7 @@ function safeReviewNotice(body: string, notice: string, maxLength = 60_000): str
     : safeBody.trimEnd();
   const suffix = marker.raw ? `${safeNotice}\n\n${marker.raw}` : safeNotice;
   const prefixLength = Math.max(0, maxLength - suffix.length - 2);
-  const prefix = withoutMarker.slice(0, prefixLength).trimEnd();
+  const prefix = markdownSafePrefix(withoutMarker, prefixLength).trimEnd();
   return prefix ? `${prefix}\n\n${suffix}` : suffix.slice(0, maxLength);
 }
 
@@ -4313,7 +4919,8 @@ export async function publishResultIfConfigured(
         for (const pending of trustedReviews.filter((review) => String(review.state || "").toUpperCase() === "PENDING")) {
           await githubRequest("DELETE", `https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews/${Number(pending.id)}`, token);
         }
-        let publishedBody = `${safePublicationText(publicationReviewBody(task, result, normalized, previous, identity), 59_700)}\n\n${publicationMarker(trust, identity, task.created_at, evidence.base_sha)}`;
+        const marker = publicationMarker(trust, identity, task.created_at, evidence.base_sha);
+        let publishedBody = publicationBodyWithMarker(publicationReviewBody(task, result, normalized, previous, identity), marker);
         const reviewPayload: JsonObject = {body: publishedBody, commit_id: evidence.head_sha};
         if (normalized.inlineComments.length) reviewPayload.comments = normalized.inlineComments;
         let pendingReview: JsonObject;
@@ -4341,7 +4948,8 @@ export async function publishResultIfConfigured(
       }
 
       const issueTrust = publicationTrust(config, task, `${repo}#issue:${Number(number)}`);
-      const body = `${safePublicationText(publicationCommentBody(task, result, "Coven task result"), 59_700)}\n\n${publicationMarker(issueTrust, identity, task.created_at)}`;
+      const marker = publicationMarker(issueTrust, identity, task.created_at);
+      const body = publicationBodyWithMarker(publicationCommentBody(task, result, "Coven task result"), marker);
       if (identities.includes(String(task.publication_identity || "")) && task.publication_comment_id) {
         try {
           const candidateResponse = await githubRequest("GET", `https://api.github.com/repos/${repo}/issues/comments/${Number(task.publication_comment_id)}`, token);
@@ -4431,15 +5039,16 @@ function publicationReviewBody(task: JsonObject, result: JsonObject, normalized:
   return [body, ...additions].join("\n\n");
 }
 
-function publicationCommentBody(task: JsonObject, result: JsonObject, heading = "Coven task result"): string {
+export function publicationCommentBody(task: JsonObject, result: JsonObject, heading = "Coven task result"): string {
   const status = result.status || "unknown";
-  const summary = String(result.summary || "No summary returned.");
-  const prBody = String(result.pr_body || "");
   const filesChanged = Array.isArray(result.files_changed) ? result.files_changed : [];
   const commits = Array.isArray(result.commits) ? result.commits : [];
   const taskId = String(task.task_id || "");
   const evidence = (task.review_evidence as JsonObject | undefined) || {};
   const review = (result.review as JsonObject | undefined) || {};
+  const knownFiles = githubKnownFileSet(task, review);
+  const summary = linkGithubFileMentions(task, String(result.summary || "No summary returned."), knownFiles);
+  const prBody = linkGithubFileMentions(task, String(result.pr_body || ""), knownFiles);
   const parts = [`## ${heading}`, "", `**Status:** ${status}`, "", summary.trim()];
   if (prBody.trim() && prBody.trim() !== summary.trim()) {
     parts.push("", prBody.trim());
@@ -4461,12 +5070,12 @@ function publicationCommentBody(task: JsonObject, result: JsonObject, heading = 
       `- Review context SHA-256: \`${evidence.review_context_sha256}\``,
     );
     if (changedFiles.length) {
-      parts.push(`- Files: ${changedFiles.slice(0, 20).map((file) => `\`${file}\``).join(", ")}`);
+      parts.push(`- Files: ${changedFiles.slice(0, 20).map((file) => githubFileMarkdown(task, String(file))).join(", ")}`);
     }
   } else {
     parts.push("- No PR review evidence was captured for this run.");
   }
-  parts.push(...structuredReviewLines(review, task));
+  parts.push(...structuredReviewLines(review, task, knownFiles));
   parts.push(
     "",
     `**Files changed:** ${filesChanged.length}`,
@@ -4475,6 +5084,388 @@ function publicationCommentBody(task: JsonObject, result: JsonObject, heading = 
     `_Task \`${taskId}\`._`,
   );
   return parts.join("\n");
+}
+
+function markdownCodeSpan(value: string): string {
+  let longestRun = 0;
+  for (const match of value.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
+  const delimiter = "`".repeat(longestRun + 1);
+  const padding = value.startsWith("`") || value.endsWith("`") ? " " : "";
+  return `${delimiter}${padding}${value}${padding}${delimiter}`;
+}
+
+function encodeGithubUrlComponent(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function githubFileRef(task: JsonObject, path: string): string {
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const details = Array.isArray(evidence.changed_file_details) ? (evidence.changed_file_details as JsonObject[]) : [];
+  const headRef = String(evidence.head_sha || evidence.workspace_head_sha || task.default_branch || "").trim();
+  for (const detail of details) {
+    const currentPath = canonicalRepoPath(String(detail.path || ""));
+    const status = String(detail.status || "").toLowerCase();
+    if (currentPath === path && status !== "removed") return headRef;
+  }
+  for (const detail of details) {
+    const currentPath = canonicalRepoPath(String(detail.path || ""));
+    const previousPath = canonicalRepoPath(String(detail.previous_path || ""));
+    const status = String(detail.status || "").toLowerCase();
+    if ((currentPath === path && status === "removed") || (status === "renamed" && previousPath === path && previousPath !== currentPath)) {
+      return String(evidence.merge_base_sha || evidence.base_sha || evidence.head_sha || evidence.workspace_head_sha || task.default_branch || "").trim();
+    }
+  }
+  return headRef;
+}
+
+function githubBlobBase(task: JsonObject, path: string): string | null {
+  const repository = String(task.repository || "").trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
+    return null;
+  }
+  const ref = githubFileRef(task, path);
+  if (!ref) {
+    return null;
+  }
+  const encodedRef = ref.split("/").map(encodeGithubUrlComponent).join("/");
+  return `https://github.com/${repository}/blob/${encodedRef}`;
+}
+
+function canonicalRepoPath(rawPath: string): string | null {
+  const display = rawPath.trim();
+  if (!display || display !== rawPath || /[\0\r\n]/.test(display)) return null;
+  let path = display;
+  while (path.startsWith("./")) path = path.slice(2);
+  const segments = path.split("/");
+  if (
+    !path
+    || path.startsWith("/")
+    || path.includes("//")
+    || segments.some((segment) => !segment || segment === "." || segment === ".." || /[\0\r\n]/.test(segment))
+  ) return null;
+  return path;
+}
+
+function parseRepoRelativePath(
+  rawPath: string,
+  knownFiles: Set<string> = new Set<string>(),
+): {display: string; path: string; line: number | null; endLine: number | null} | null {
+  const display = rawPath.trim();
+  if (!display || display !== rawPath || /[\0\r\n]/.test(display)) return null;
+
+  const resolveKnownPath = (candidate: string): string | null => {
+    const exact = canonicalRepoPath(candidate);
+    if (exact && knownFiles.has(exact)) return exact;
+    const slashNormalized = canonicalRepoPath(candidate.replaceAll("\\", "/"));
+    if (slashNormalized && knownFiles.has(slashNormalized)) return slashNormalized;
+    return null;
+  };
+  const exactKnown = resolveKnownPath(display);
+  if (exactKnown) return {display, path: exactKnown, line: null, endLine: null};
+
+  let pathCandidate = display;
+  let line: number | null = null;
+  let endLine: number | null = null;
+  const lineMatch = /^(.*):(\d+)(?:-(\d+))?$/.exec(pathCandidate);
+  if (lineMatch) {
+    pathCandidate = lineMatch[1];
+    line = Number(lineMatch[2]);
+    endLine = lineMatch[3] ? Number(lineMatch[3]) : null;
+  }
+  const knownPath = resolveKnownPath(pathCandidate);
+  if (knownPath) return {display, path: knownPath, line, endLine};
+  if (/^[\\/]/.test(pathCandidate) || /^[A-Za-z]:[\\/]/.test(pathCandidate)) return null;
+  const path = canonicalRepoPath(pathCandidate.replaceAll("\\", "/"));
+  if (!path || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)) return null;
+  return {display, path, line, endLine};
+}
+
+function githubFileMentionAllowed(target: NonNullable<ReturnType<typeof parseRepoRelativePath>>, knownFiles: Set<string>): boolean {
+  const filename = target.path.split("/").at(-1) || "";
+  return knownFiles.has(target.path)
+    || (!/\s/.test(target.display) && target.path.includes("/") && /\.[A-Za-z][A-Za-z0-9._-]{0,15}$/.test(filename));
+}
+
+function githubFileMarkdown(
+  task: JsonObject,
+  rawPath: string,
+  lineOverride: number | null = null,
+  knownFiles: Set<string> = githubKnownFileSet(task),
+): string {
+  const target = parseRepoRelativePath(rawPath, knownFiles);
+  const plain = markdownCodeSpan(rawPath);
+  if (!target || !githubFileMentionAllowed(target, knownFiles)) {
+    return plain;
+  }
+  const base = githubBlobBase(task, target.path);
+  if (!base) {
+    return plain;
+  }
+  const encodedPath = target.path.split("/").map(encodeGithubUrlComponent).join("/");
+  const line = lineOverride ?? target.line;
+  const endLine = lineOverride === null ? target.endLine : null;
+  const lineAnchor = line !== null && Number.isFinite(line) && line > 0
+    ? `#L${line}${endLine !== null && Number.isFinite(endLine) && endLine > line ? `-L${endLine}` : ""}`
+    : "";
+  return `[${markdownCodeSpan(target.display)}](${base}/${encodedPath}${lineAnchor})`;
+}
+
+function githubKnownFileSet(task: JsonObject, review: JsonObject = {}): Set<string> {
+  const knownFiles = new Set<string>();
+  const evidence = (task.review_evidence as JsonObject | undefined) || {};
+  const addFile = (value: JsonValue | undefined) => {
+    const path = canonicalRepoPath(String(value || ""));
+    if (path) knownFiles.add(path);
+  };
+  const addFiles = (value: JsonValue | undefined) => {
+    if (Array.isArray(value)) value.forEach(addFile);
+  };
+  addFiles(evidence.changed_files);
+  if (Array.isArray(evidence.changed_file_details)) {
+    for (const value of evidence.changed_file_details) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      addFile((value as JsonObject).path);
+      addFile((value as JsonObject).previous_path);
+    }
+  }
+  addFiles(review.reviewed_files);
+  addFiles(review.supporting_files);
+  return knownFiles;
+}
+
+function inlineCodeWithGithubFileLinks(task: JsonObject, rawText: string, knownFiles: Set<string> = githubKnownFileSet(task)): string {
+  const plain = markdownCodeSpan(rawText);
+  const direct = githubFileMarkdown(task, rawText, null, knownFiles);
+  if (direct !== plain) {
+    return direct;
+  }
+
+  let linkedAny = false;
+  const parts = rawText.split(/(\s+)/).map((part) => {
+    if (!part || /^\s+$/.test(part)) {
+      return part;
+    }
+    const unlinked = markdownCodeSpan(part);
+    const linked = githubFileMarkdown(task, part, null, knownFiles);
+    if (linked !== unlinked) {
+      linkedAny = true;
+      return linked;
+    }
+    return unlinked;
+  });
+
+  return linkedAny ? parts.join("") : plain;
+}
+
+function bareFileMentionAllowed(rawPath: string, knownFiles: Set<string>): boolean {
+  const target = parseRepoRelativePath(rawPath, knownFiles);
+  return Boolean(target && githubFileMentionAllowed(target, knownFiles));
+}
+
+function urlAuthorityLooksValid(authority: string): boolean {
+  if (/^\[[0-9A-F:.%]+\](?::\d{1,5})?$/i.test(authority)) return true;
+  let host = authority;
+  const port = /:(\d{1,5})$/.exec(host);
+  if (port) host = host.slice(0, -port[0].length);
+  if (host.toLowerCase() === "localhost") return true;
+  const labels = host.split(".");
+  if (labels.length === 4 && labels.every((label) => /^\d{1,3}$/.test(label) && Number(label) <= 255)) return true;
+  if (labels.length < 2 || !/^[A-Za-z]{2,63}$/.test(labels.at(-1) || "")) return false;
+  return labels.every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label));
+}
+
+function markdownUrlLikeCandidate(candidate: string): boolean {
+  if (/^[A-Za-z][A-Za-z0-9+.-]{0,31}:/.test(candidate)) return true;
+  const authorityCandidate = candidate.startsWith("//") ? candidate.slice(2) : candidate;
+  const authority = authorityCandidate.split(/[/?#]/, 1)[0];
+  return urlAuthorityLooksValid(authority);
+}
+
+function markdownUrlLikeRanges(text: string, knownFiles: Set<string>): Array<{start: number; end: number}> {
+  const ranges: Array<{start: number; end: number}> = [];
+  for (const match of text.matchAll(/\S+/g)) {
+    const token = match[0];
+    let leading = /^[({<"']*/.exec(token)?.[0].length || 0;
+    const protectedLeading = leading;
+    let candidateEnd = token.length;
+    while (candidateEnd > leading && /[>)}\],.;!?"']/.test(token[candidateEnd - 1])) candidateEnd -= 1;
+    let candidate = token.slice(leading, candidateEnd);
+    if (!candidate) continue;
+    const emphasis = /^(\*{1,3}|_{1,3}|~{2,})(.+)\1$/.exec(candidate);
+    if (emphasis) {
+      leading += emphasis[1].length;
+      candidateEnd -= emphasis[1].length;
+      candidate = token.slice(leading, candidateEnd);
+    }
+    const repoTarget = parseRepoRelativePath(candidate, knownFiles);
+    if (repoTarget && knownFiles.has(repoTarget.path)) continue;
+    if (!markdownUrlLikeCandidate(candidate)) {
+      const assignment = /^(?:url|uri|href|endpoint|website|link)=/i.exec(candidate);
+      if (!assignment) continue;
+      candidate = candidate.slice(assignment[0].length);
+      if (!markdownUrlLikeCandidate(candidate)) continue;
+      leading += assignment[0].length;
+    }
+    ranges.push({start: match.index + protectedLeading, end: match.index + token.length});
+  }
+  return ranges;
+}
+
+function linkBareGithubFileMentions(task: JsonObject, text: string, knownFiles: Set<string>): string {
+  const protectedRanges = [
+    ...markdownProtectedRanges(text),
+    ...markdownUrlLikeRanges(text, knownFiles),
+  ].sort((left, right) => left.start - right.start || right.end - left.end);
+  let nextRange = 0;
+  let furthestProtectedEnd = -1;
+  let output = "";
+  let cursor = 0;
+  for (const candidate of text.matchAll(/[A-Za-z0-9_.:/-]+/g)) {
+    const match = candidate[0];
+    const pathOffset = candidate.index;
+    output += text.slice(cursor, pathOffset);
+    cursor = pathOffset + match.length;
+    while (nextRange < protectedRanges.length && protectedRanges[nextRange].start <= pathOffset) {
+      furthestProtectedEnd = Math.max(furthestProtectedEnd, protectedRanges[nextRange].end);
+      nextRange += 1;
+    }
+    const previous = pathOffset > 0 ? text[pathOffset - 1] : "";
+    if (furthestProtectedEnd > pathOffset || /[[\]()`]/.test(previous)) {
+      output += match;
+      continue;
+    }
+    let rawPath = match;
+    const exactPath = canonicalRepoPath(rawPath);
+    const firstSegment = rawPath.split("/")[0];
+    if (!(exactPath && knownFiles.has(exactPath)) && /^(?:www\.)?(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$/i.test(firstSegment)) {
+      output += match;
+      continue;
+    }
+    while (rawPath && /[.:]$/.test(rawPath) && !(exactPath && knownFiles.has(exactPath))) {
+      rawPath = rawPath.slice(0, -1);
+    }
+    let rawOffset = 0;
+    if (!(exactPath && knownFiles.has(exactPath))) {
+      const emphasis = /^(_{1,3})(.+)\1$/.exec(rawPath);
+      if (emphasis && bareFileMentionAllowed(emphasis[2], knownFiles)) {
+        rawOffset = emphasis[1].length;
+        rawPath = emphasis[2];
+      }
+    }
+    if (!rawPath || !bareFileMentionAllowed(rawPath, knownFiles)) {
+      output += match;
+      continue;
+    }
+    const plain = markdownCodeSpan(rawPath);
+    const linked = githubFileMarkdown(task, rawPath, null, knownFiles);
+    output += linked === plain
+      ? match
+      : `${match.slice(0, rawOffset)}${linked}${match.slice(rawOffset + rawPath.length)}`;
+  }
+  return `${output}${text.slice(cursor)}`;
+}
+
+function linkInlineCodeFileMentions(task: JsonObject, text: string, knownFiles: Set<string>): string {
+  let output = "";
+  let cursor = 0;
+  const protectedRanges = markdownLinkRanges(text);
+  let nextRange = 0;
+  while (cursor < text.length) {
+    if (nextRange < protectedRanges.length && cursor === protectedRanges[nextRange].start) {
+      output += text.slice(cursor, protectedRanges[nextRange].end);
+      cursor = protectedRanges[nextRange].end;
+      nextRange += 1;
+      continue;
+    }
+    if (text[cursor] !== "`") {
+      if (text[cursor] === "\\" && cursor + 1 < text.length) {
+        output += text.slice(cursor, cursor + 2);
+        cursor += 2;
+        continue;
+      }
+      output += text[cursor];
+      cursor += 1;
+      continue;
+    }
+    let openingEnd = cursor;
+    while (text[openingEnd] === "`") openingEnd += 1;
+    const delimiterLength = openingEnd - cursor;
+    let search = openingEnd;
+    let closingStart = -1;
+    let closingEnd = -1;
+    while (search < text.length) {
+      if (text[search] !== "`") {
+        search += 1;
+        continue;
+      }
+      let runEnd = search;
+      while (text[runEnd] === "`") runEnd += 1;
+      if (runEnd - search === delimiterLength) {
+        closingStart = search;
+        closingEnd = runEnd;
+        break;
+      }
+      search = runEnd;
+    }
+    if (closingStart < 0) {
+      output += text.slice(cursor);
+      break;
+    }
+    const match = text.slice(cursor, closingEnd);
+    const rawPath = text.slice(openingEnd, closingStart);
+    output += inlineCodeWithGithubFileLinks(task, rawPath, knownFiles);
+    cursor = closingEnd;
+  }
+  return output;
+}
+
+function linkMarkdownProseLine(task: JsonObject, line: string, knownFiles: Set<string>): string {
+  return linkBareGithubFileMentions(task, linkInlineCodeFileMentions(task, line, knownFiles), knownFiles);
+}
+
+function linkGithubFileMentions(task: JsonObject, text: string, knownFiles: Set<string> = githubKnownFileSet(task)): string {
+  let activeFence: {marker: "`" | "~"; length: number} | null = null;
+  let referenceContinuation: "destination" | "title" | null = null;
+  return text
+    .split(/(\r?\n)/)
+    .map((segment, index) => {
+      if (index % 2 === 1) return segment;
+      if (activeFence) {
+        const closing = new RegExp(`^ {0,3}${activeFence.marker}{${activeFence.length},}[ \\t]*$`);
+        if (closing.test(segment)) activeFence = null;
+        return segment;
+      }
+      const opening = /^ {0,3}(`{3,}|~{3,})/.exec(segment);
+      if (opening) {
+        referenceContinuation = null;
+        activeFence = {marker: opening[1][0] as "`" | "~", length: opening[1].length};
+        return segment;
+      }
+      if (referenceContinuation === "destination") {
+        referenceContinuation = segment.trim() ? "title" : null;
+        return segment;
+      }
+      if (referenceContinuation === "title") {
+        referenceContinuation = null;
+        if (/^ {0,3}["'(]/.test(segment)) return segment;
+      }
+      if (/^(?: {4}|\t)/.test(segment)) return segment;
+      const referenceDefinition = /^ {0,3}\[(?:\\.|[^\\\]\r\n])+\]:[ \t]*(.*)$/.exec(segment);
+      if (referenceDefinition) {
+        referenceContinuation = referenceDefinition[1].trim() ? "title" : "destination";
+        return segment;
+      }
+      return linkMarkdownProseLine(task, segment, knownFiles);
+    })
+    .join("");
+}
+
+function reviewTestCommandMarkdown(task: JsonObject, rawCommand: string, knownFiles: Set<string>): string {
+  const command = rawCommand.trim();
+  if (!command) {
+    return "`unknown command`";
+  }
+  return inlineCodeWithGithubFileLinks(task, command, knownFiles);
 }
 
 function reviewFixLoopLines(task: JsonObject): string[] {
@@ -4492,19 +5483,7 @@ function reviewFixLoopLines(task: JsonObject): string[] {
   return lines;
 }
 
-function githubFileMarkdown(task: JsonObject, raw: JsonValue): string {
-  const match = String(raw).match(/^(.*?)(?::(\d+))?$/);
-  const path = repositoryPath(match?.[1]);
-  const evidence = (task.review_evidence as JsonObject | undefined) || {};
-  const ref = String(evidence.head_sha || "").trim();
-  const repo = String(task.repository || "").trim();
-  if (!path || !ref || !repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return `\`${String(raw)}\``;
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  const anchor = match?.[2] ? `#L${match[2]}` : "";
-  return `[\`${String(raw)}\`](https://github.com/${repo}/blob/${encodeURIComponent(ref)}/${encodedPath}${anchor})`;
-}
-
-function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] {
+function structuredReviewLines(review: JsonObject, task: JsonObject, knownFiles: Set<string> = githubKnownFileSet(task, review)): string[] {
   if (!Object.keys(review).length) {
     return ["", "### Structured review", "- No structured review result was emitted."];
   }
@@ -4518,7 +5497,7 @@ function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] 
   const reviewedFiles = Array.isArray(review.reviewed_files) ? review.reviewed_files : [];
   lines.push(`- Reviewed files: ${reviewedFiles.length}`);
   if (reviewedFiles.length) {
-    lines.push(`- Reviewed file list: ${reviewedFiles.slice(0, 20).map((path) => task ? githubFileMarkdown(task, path) : `\`${path}\``).join(", ")}`);
+    lines.push(`- Reviewed file list: ${reviewedFiles.slice(0, 20).map((path) => githubFileMarkdown(task, String(path), null, knownFiles)).join(", ")}`);
     if (reviewedFiles.length > 20) {
       lines.push("- Reviewed file list truncated after 20 entries.");
     }
@@ -4526,7 +5505,7 @@ function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] 
   const supportingFiles = Array.isArray(review.supporting_files) ? review.supporting_files : [];
   lines.push(`- Supporting files inspected: ${supportingFiles.length}`);
   if (supportingFiles.length) {
-    lines.push(`- Supporting file list: ${supportingFiles.slice(0, 20).map((path) => task ? githubFileMarkdown(task, path) : `\`${path}\``).join(", ")}`);
+    lines.push(`- Supporting file list: ${supportingFiles.slice(0, 20).map((path) => githubFileMarkdown(task, String(path), null, knownFiles)).join(", ")}`);
     if (supportingFiles.length > 20) {
       lines.push("- Supporting file list truncated after 20 entries.");
     }
@@ -4538,7 +5517,8 @@ function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] 
     if (finding.line !== undefined && finding.line !== null) {
       location = `${location}:${finding.line}`;
     }
-    lines.push(`  ${index + 1}. \`${finding.severity || "unknown"}\` ${location} - ${finding.title || "Untitled finding"}`);
+    const linkedLocation = githubFileMarkdown(task, location, Number(finding.line || 0) || null, knownFiles);
+    lines.push(`  ${index + 1}. \`${finding.severity || "unknown"}\` ${linkedLocation} - ${finding.title || "Untitled finding"}`);
     if (finding.body) lines.push(`     - ${safePublicationText(String(finding.body), 700)}`);
     if (finding.recommendation) lines.push(`     - Suggested resolution: ${safePublicationText(String(finding.recommendation), 500)}`);
   });
@@ -4547,13 +5527,14 @@ function structuredReviewLines(review: JsonObject, task?: JsonObject): string[] 
     lines.push(`- ${omitted} additional finding${omitted === 1 ? " was" : "s were"} omitted because the GitHub review body is size-limited; inspect the persisted result artifact for the complete set.`);
   }
   if (review.no_findings_reason) {
-    lines.push(`- No-findings reason: ${review.no_findings_reason}`);
+    lines.push(`- No-findings reason: ${linkGithubFileMentions(task, String(review.no_findings_reason), knownFiles)}`);
   }
   const testsRun = Array.isArray(review.tests_run) ? (review.tests_run as JsonObject[]) : [];
   lines.push(`- Tests reported by runtime: ${testsRun.length}`);
   testsRun.slice(0, 10).forEach((item) => {
-    const summary = item.output_summary ? ` - ${item.output_summary}` : "";
-    lines.push(`  - \`${item.command || "unknown command"}\`: \`${item.status || "unknown"}\`${summary}`);
+    const command = reviewTestCommandMarkdown(task, String(item.command || "unknown command"), knownFiles);
+    const summary = item.output_summary ? ` - ${linkGithubFileMentions(task, String(item.output_summary), knownFiles)}` : "";
+    lines.push(`  - ${command}: \`${item.status || "unknown"}\`${summary}`);
   });
   if (testsRun.length > 10) {
     lines.push("- Test list truncated after 10 entries.");
@@ -4679,7 +5660,6 @@ export function runtimeDiagnostic(result: CommandResult): string | null {
     return `Coven Code exited ${result.returncode} without a diagnostic.`;
   }
   const safe = redactTokenish(raw)
-    .replace(/[A-Z0-9._%+-]+(?:\[[A-Z0-9_-]+\])?@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted email]")
     .replace(/\bon account\s+[^\n.]+/gi, "on the configured account")
     .replace(/\s+/g, " ")
     .trim();
@@ -4710,18 +5690,43 @@ export function runtimeProcessEnvironment(source: NodeJS.ProcessEnv, codexAccess
   };
 }
 
+function redactPrivateKeyBlocks(text: string): string {
+  const active = new Map<string, number>();
+  const ranges: Array<{start: number; end: number}> = [];
+  for (const token of text.matchAll(/-----(BEGIN|END) ([A-Z ]{0,64}PRIVATE KEY)-----/g)) {
+    const label = token[2];
+    if (token[1] === "BEGIN") {
+      if (!active.has(label)) active.set(label, token.index);
+      continue;
+    }
+    const start = active.get(label);
+    if (start === undefined) continue;
+    ranges.push({start, end: token.index + token[0].length});
+    active.delete(label);
+  }
+  if (!ranges.length) return text;
+  ranges.sort((left, right) => left.start - right.start || left.end - right.end);
+  let output = "";
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.end <= cursor) continue;
+    output += `${text.slice(cursor, Math.max(cursor, range.start))}[redacted private key]`;
+    cursor = range.end;
+  }
+  return `${output}${text.slice(cursor)}`;
+}
+
 export function redactTokenish(text: string): string {
   if (!text) {
     return text;
   }
-  return text
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted private key]")
+  return redactPrivateKeyBlocks(text)
     .replace(/(https?:\/\/)[^/\s:@]+:[^@\s/]+@/gi, "$1[redacted]@")
     .replace(/x-access-token:[^@\s'\"]+/gi, "x-access-token:[redacted]")
     .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_-]{6,}/g, "[redacted github token]")
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}/g, "[redacted OpenAI token]")
     .replace(/\bBearer\s+[^\s'\"]+/gi, "Bearer [redacted]")
-    .replace(/[A-Z0-9._%+-]+(?:\[[A-Z0-9_-]+\])?@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted email]")
+    .replace(/(^|[^A-Z0-9._%+-])([A-Z0-9._%+-]{1,64}(?:\[[A-Z0-9_-]{1,64}\])?@[A-Z0-9.-]{1,253}\.[A-Z]{2,63})(?![A-Z0-9.-])/gi, "$1[redacted email]")
     .replace(/\bon account\s+`?[^`\n.]+`?/gi, "on the configured account")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted JWT]");
 }
