@@ -2127,7 +2127,10 @@ async function maybeRunRepair(config: AdapterConfig, taskId: string, inputTask?:
       } else if (live.headSha !== preparedCommit || live.baseSha !== evidenceRevision.baseSha) {
         return repairStop(path, task, "repair_stale_head_during_push_recovery");
       }
-      const liveAfter = await currentPullRevision(String(task.repository), prNumber, repairToken);
+      const liveAfter = await waitForExpectedPullRevision(
+        () => currentPullRevision(String(task.repository), prNumber, repairToken),
+        {headSha: preparedCommit, baseSha: evidenceRevision.baseSha},
+      );
       if (liveAfter.headSha !== preparedCommit || liveAfter.baseSha !== evidenceRevision.baseSha) return repairStop(path, task, "repair_pushed_revision_unverified");
       const followupTaskId = await createFollowupReviewTask(config, task, currentPolicy, preparedCommit, liveAfter.baseSha, String(task.repair_finding_signature || signature), preparedCommit);
       task.repair_state = "repair_committed";
@@ -2260,7 +2263,10 @@ async function maybeRunRepair(config: AdapterConfig, taskId: string, inputTask?:
     const push = runCommand([config.hostGitBin, "-c", "core.hooksPath=/dev/null", "push", "origin", `HEAD:refs/heads/${headRef}`], repairWorkspace, gitEnv, 180);
     writeJsonAtomic(join(artifactDir, "repair-push.json"), redactedCommandResult(push));
     if (push.returncode !== 0) return repairStop(path, task, "repair_push_failed", push.stderr);
-    const liveAfterPush = await currentPullRevision(String(task.repository), prNumber, repairToken);
+    const liveAfterPush = await waitForExpectedPullRevision(
+      () => currentPullRevision(String(task.repository), prNumber, repairToken),
+      {headSha: commitSha, baseSha: evidenceRevision.baseSha},
+    );
     if (liveAfterPush.headSha !== commitSha || liveAfterPush.baseSha !== evidenceRevision.baseSha) return repairStop(path, task, "repair_pushed_revision_unverified");
     const followupTaskId = await createFollowupReviewTask(config, task, refreshedPolicy, commitSha, liveAfterPush.baseSha, signature, commitSha);
     task.repair_state = "repair_committed";
@@ -3658,7 +3664,7 @@ interface SubmittedReview {
   staleEvidence: boolean;
 }
 
-interface PullRevision {
+export interface PullRevision {
   headSha: string;
   baseSha: string;
 }
@@ -3670,6 +3676,24 @@ function reviewEvidenceRevision(task: JsonObject): PullRevision {
 
 function samePullRevision(left: PullRevision, right: PullRevision): boolean {
   return Boolean(left.headSha && left.baseSha && left.headSha === right.headSha && left.baseSha === right.baseSha);
+}
+
+export async function waitForExpectedPullRevision(
+  readRevision: () => Promise<PullRevision>,
+  expected: PullRevision,
+  attempts = 6,
+  delayMs = 500,
+): Promise<PullRevision> {
+  const boundedAttempts = Math.max(1, Math.min(20, Math.trunc(attempts)));
+  let latest: PullRevision = {headSha: "", baseSha: ""};
+  for (let attempt = 0; attempt < boundedAttempts; attempt += 1) {
+    latest = await readRevision();
+    if (samePullRevision(latest, expected)) return latest;
+    if (attempt + 1 < boundedAttempts && delayMs > 0) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+  }
+  return latest;
 }
 
 async function currentPullRevision(repo: string, prNumber: number, token: string): Promise<PullRevision> {
@@ -4562,7 +4586,7 @@ export function runtimeDiagnostic(result: CommandResult): string | null {
     return `Coven Code exited ${result.returncode} without a diagnostic.`;
   }
   const safe = redactTokenish(raw)
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted email]")
+    .replace(/[A-Z0-9._%+-]+(?:\[[A-Z0-9_-]+\])?@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted email]")
     .replace(/\bon account\s+[^\n.]+/gi, "on the configured account")
     .replace(/\s+/g, " ")
     .trim();
@@ -4604,7 +4628,7 @@ export function redactTokenish(text: string): string {
     .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_-]{6,}/g, "[redacted github token]")
     .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}/g, "[redacted OpenAI token]")
     .replace(/\bBearer\s+[^\s'\"]+/gi, "Bearer [redacted]")
-    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[redacted email]")
+    .replace(/[A-Z0-9._%+-]+(?:\[[A-Z0-9_-]+\])?@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted email]")
     .replace(/\bon account\s+`?[^`\n.]+`?/gi, "on the configured account")
     .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted JWT]");
 }

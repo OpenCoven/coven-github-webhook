@@ -41,6 +41,7 @@ import {
   sanitizedRuntimeEnvironment,
   sessionBrief,
   trustedValidationFindings,
+  waitForExpectedPullRevision,
   withEphemeralCodexCredential,
   type JsonObject,
   type JsonValue,
@@ -803,6 +804,25 @@ test("a successful repair creates one deterministic new-SHA follow-up task with 
   assert.equal(followup.repair_iteration, 1);
   assert.equal((followup.target as JsonObject).head_sha, newHead);
   assert.equal((followup.repair_history as JsonObject[])[0].finding_signature, "finding-signature");
+});
+
+test("repair verification waits for GitHub to expose the pushed head", async () => {
+  const expected = {headSha: "c".repeat(40), baseSha: "b".repeat(40)};
+  let reads = 0;
+  const observed = await waitForExpectedPullRevision(async () => {
+    reads += 1;
+    return reads < 3 ? {headSha: "a".repeat(40), baseSha: expected.baseSha} : expected;
+  }, expected, 6, 0);
+  assert.deepEqual(observed, expected);
+  assert.equal(reads, 3);
+
+  reads = 0;
+  const stale = await waitForExpectedPullRevision(async () => {
+    reads += 1;
+    return {headSha: "a".repeat(40), baseSha: expected.baseSha};
+  }, expected, 2, 0);
+  assert.equal(stale.headSha, "a".repeat(40));
+  assert.equal(reads, 2);
 });
 
 test("repair eligibility fails closed for forks, protected branches, limits, repeats, and kill switches", () => {
@@ -3279,7 +3299,7 @@ test("redacts credentials and passes only allowlisted ambient environment keys",
   const redacted = redactTokenish(secretText);
   assert.doesNotMatch(redacted, /1234567890|topsecret|password|private-data|eyJabc|reviewer@example\.com|reviewer \(/);
   const artifact = redactedCommandResult({
-    args: ["git", "-c", "user.email=reviewer@example.com", "https://x-access-token:ghs_1234567890@github.com/OpenCoven/example.git"],
+    args: ["git", "-c", "user.email=covencat[bot]@users.noreply.github.com", "https://x-access-token:ghs_1234567890@github.com/OpenCoven/example.git"],
     returncode: 1,
     stdout: "Bearer topsecret",
     stderr: "reviewer@example.com",
@@ -3291,7 +3311,7 @@ test("redacts credentials and passes only allowlisted ambient environment keys",
     output_limit_bytes: 1024,
     spawn_error: "failed for reviewer@example.com",
   });
-  assert.doesNotMatch(JSON.stringify(artifact), /1234567890|topsecret|reviewer@example\.com/);
+  assert.doesNotMatch(JSON.stringify(artifact), /1234567890|topsecret|covencat\[bot\]@users\.noreply\.github\.com/);
   assert.deepEqual(artifact.args, ["git", "-c", "user.email=[redacted email]", "https://[redacted]@github.com/OpenCoven/example.git"]);
   const env = sanitizedRuntimeEnvironment({
     PATH: "/bin", LANG: "C.UTF-8", SSH_AUTH_SOCK: "/tmp/agent.sock",
