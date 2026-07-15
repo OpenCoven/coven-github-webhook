@@ -1,0 +1,20 @@
+[Unit]
+Description=Bounded persistent Covencat state filesystem
+After=local-fs.target
+
+[Service]
+Type=simple
+Environment=FUSE2FS_ROOT=%h/.local/opt/fuse2fs
+Environment=STATE_IMAGE=%h/covencat-deploy/state-volume/covencat-state.ext4
+Environment=STATE_MOUNT=%h/covencat-deploy/state-volume/mount
+ExecStartPre=/usr/bin/test -f ${STATE_IMAGE}
+ExecStartPre=/usr/bin/mkdir -p ${STATE_MOUNT}
+ExecStart=/usr/bin/env LD_LIBRARY_PATH=${FUSE2FS_ROOT}/usr/lib/x86_64-linux-gnu:${FUSE2FS_ROOT}/lib/x86_64-linux-gnu ${FUSE2FS_ROOT}/usr/bin/fuse2fs ${STATE_IMAGE} ${STATE_MOUNT} -f -o rw,nosuid,nodev,fakeroot,uid=1000,gid=1000
+ExecStartPost=/usr/bin/chmod 0700 ${STATE_MOUNT}
+ExecStop=/usr/bin/fusermount3 -u ${STATE_MOUNT}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

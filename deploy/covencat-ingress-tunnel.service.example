@@ -1,0 +1,21 @@
+[Unit]
+Description=Restricted Covencat ingress tunnel
+After=network-online.target covencat-worker.service
+Wants=network-online.target
+Requires=covencat-worker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T \
+  -o BatchMode=yes -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=%h/.ssh/covencat_known_hosts \
+  -i %h/.ssh/covencat_ingress_ed25519 \
+  -R 127.0.0.1:18096:127.0.0.1:3900 \
+  replace-with-ingress-user@replace-with-ingress-host
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
