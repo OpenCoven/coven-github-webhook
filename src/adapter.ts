@@ -2715,7 +2715,7 @@ function executionOnlyLimitation(value: string): boolean {
 }
 
 export function expectedReviewScopeStatement(value: string): boolean {
-  const describesExpectedScope = /\b(?:bounded(?: review)? scope|bounded review instructions?|reviewed only the changed files?|limited to (?:the )?(?:supplied )?change set)\b/i.test(value)
+  const describesExpectedScope = /\b(?:bounded(?: review)? scope|bounded review instructions?|review(?:ed)? (?:was |is )?bounded to|reviewed only the changed files?|limited to (?:the )?(?:supplied )?change set)\b/i.test(value)
     && /\b(?:changed files?|change set|supporting context|agent guidance|AGENTS\.md)\b/i.test(value);
   const reportsMaterialConstraint = /\b(?:unable|could not|couldn't|missing|truncated|unavailable|uncertain|incomplete|not provided|not supplied|failed to inspect|relevant (?:dependency|file|context).{0,30}(?:not|missing|unavailable))\b/i.test(value);
   return describesExpectedScope && !reportsMaterialConstraint;

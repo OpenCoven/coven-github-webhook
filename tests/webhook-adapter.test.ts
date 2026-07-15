@@ -1164,6 +1164,9 @@ test("distinguishes expected bounded review scope from material limitations", ()
     "The review is limited to the supplied change set and supporting context and does not assess unrelated repository areas.",
   ), true);
   assert.equal(expectedReviewScopeStatement(
+    "High confidence; the review was bounded to the supplied changed files plus directly relevant supporting context, and no material limitation remains.",
+  ), true);
+  assert.equal(expectedReviewScopeStatement(
     "I reviewed only the changed file because relevant dependency context was unavailable.",
   ), false);
   assert.equal(expectedReviewScopeStatement(
