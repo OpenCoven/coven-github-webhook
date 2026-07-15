@@ -21,6 +21,7 @@ process.once("message", (message) => {
         publication_attempts: task.publication_attempts,
         retry_not_before: task.retry_not_before,
         failure_category: task.failure_category,
+        followup_task_id: task.followup_task_id,
         }, () => resolveSend()) || resolveSend());
     } catch (error) {
       const detail = redactTokenish(String((error as Error).stack || error));

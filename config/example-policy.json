@@ -8,6 +8,8 @@
             "issues.labeled",
             "issue_comment.created",
             "pull_request_review_comment.created",
+            "pull_request.opened",
+            "pull_request.ready_for_review",
             "pull_request.synchronize",
             "pull_request.edited",
             "pull_request.reopened",
@@ -31,8 +33,36 @@
             ]
           },
           "publication": {
-            "mode": "record_only"
-          }
+            "mode": "record_only",
+            "validation_commands": [
+              "npm test"
+            ],
+            "validation_timeout_seconds": 300
+          },
+          "autoreview": {
+            "enabled": false,
+            "include_drafts": false
+          },
+          "repair": {
+            "enabled": false,
+            "max_attempts": 2,
+            "max_changed_files": 8,
+            "max_diff_bytes": 262144,
+            "allowed_paths": [
+              "src/**",
+              "tests/**"
+            ],
+            "protected_branches": [
+              "release/**"
+            ]
+          },
+          "protected_paths": [
+            ".github/**",
+            "CODEOWNERS",
+            "**/CODEOWNERS"
+          ],
+          "kill_switch": false,
+          "enabled": true
         }
       }
     }

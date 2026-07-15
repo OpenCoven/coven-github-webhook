@@ -118,6 +118,20 @@ blocked until the mandatory runtime sandbox below passes its executable probe.
 For decisive native reviews, also configure a bounded list of trusted
 validation commands under `publication.validation_commands`; a runtime-authored
 claim without a matching successful sandbox receipt is published as COMMENT.
+The adapter replaces model-authored `tests_run` claims with signed host receipts;
+file reads, searches, PR text, and model narratives are never execution proof.
+
+Autoreview and branch repair are independent repository opt-ins. Configure
+`autoreview.enabled` for exact-SHA reviews and optionally `include_drafts`.
+Configure `repair.enabled` only for trusted same-repository branches, with
+`max_attempts` from 1 through 3, bounded `allowed_paths`, `protected_paths`,
+`protected_branches`, `max_changed_files`, and `max_diff_bytes`. Repair sessions
+receive file tools only; the host performs validation, commit, and non-force push
+with a fresh repository-scoped installation token. Set `kill_switch` at the
+repository route to stop both new tasks and any in-progress repair before push.
+The GitHub App installation must grant repository Contents read/write for repair;
+the adapter requests that authority only in the fresh repair token and does not
+reuse the publication or runtime token.
 
 ## Runtime Checklist
 
@@ -159,6 +173,46 @@ controls. A state directory from an older deployment must be owned by the
 service user and made inaccessible to group/other (for example, `chmod -R go-rwx
 "$COVEN_GITHUB_STATE_DIR"`) before this version starts.
 
+The checked-in [`deploy/Containerfile`](../deploy/Containerfile) is the
+reference production boundary. It resolves the fixed GitHub and Codex endpoint
+allowlist while building the immutable image, installs those addresses into
+both the service and sandbox root filesystems, and applies a default-deny nft
+output policy before dropping all capabilities. DNS, loopback, LAN, metadata,
+IPv6, and non-HTTPS egress remain blocked; the only private-address exception is
+the container's fixed self-address on the webhook listener port, which rootless
+Podman uses to deliver ingress. The example user service additionally
+sets cgroup memory, CPU, PID, file-descriptor, process, tmpfs, and read-only
+root-filesystem limits. Mount `COVEN_GITHUB_STATE_DIR` from a dedicated,
+persistent filesystem no larger than 8 GiB; the entrypoint measures the backing
+filesystem and refuses startup above `COVEN_STATE_FILESYSTEM_MAX_BYTES`. Build
+input `deploy/artifacts/coven-code` must be the tested binary for the recorded
+Coven Code revision; the directory is ignored by git and must never contain
+credentials.
+
+Always start the resulting image by digest, retain the previous digest for
+rollback, and verify the image labels, nft rules, zero effective capabilities,
+allowed GitHub/Codex reachability, rejected non-allowlisted egress, health
+endpoint, and signed-webhook rejection before enabling publication. If an
+allowlisted service changes addresses, build and verify a new immutable image;
+do not enable DNS or widen the runtime network as a shortcut.
+Run `node /usr/share/coven/probe-runtime.mjs` with the production mounts and
+environment to execute the same bubblewrap read/write/network probe used by a
+real task before promotion.
+Run `node /usr/share/coven/verify-github-app.mjs` in the same image to verify
+the live installation has pull-request and push subscriptions plus the exact
+Contents, Pull requests, Issues, and Metadata authority needed by review and
+repair. A checked-in manifest is not evidence of the live App settings.
+
+When public ingress and the sandbox host are separate, keep all App and model
+credentials on the sandbox host. The reference ingress relay forwards raw
+headers and bodies to a loopback-only reverse port and holds no secrets. Restrict
+its SSH key server-side with `restrict,port-forwarding,permitopen="none"` and an
+exact `permitlisten` for that one loopback port. Pin the host key, bind both ends
+to loopback, and never expose the worker port directly to the LAN or Internet.
+The state-volume example uses a fixed-size ext4 image through FUSE so attempts
+and recovery artifacts persist while the entrypoint's 8 GiB hard check remains
+meaningful.
+
 This release passes the model credential to `coven-code`, so an untrusted
 checkout can still try to consume or encode it through the allowed model
 channel. Limit real execution to trusted repositories. Supporting public or
@@ -167,9 +221,16 @@ a quota-limited credential broker that does not expose a reusable model token
 to repository code; the declaration above must remain unset until that boundary
 is actually deployed.
 
+Mount the Codex token directory writable only by the service account. The host
+refreshes an access token within five minutes of expiry, atomically persists the
+rotated OAuth record, and passes only the access token into bubblewrap. The
+refresh token and account registry are never mounted into a task sandbox.
+
 The adapter mounts only per-task input (read-only), the checkout and result
 directory (writable), and the checkout `.git` directory again as read-only. It
-passes no GitHub token, askpass helper, App secret, SSH agent, or parent home to
+uses an empty `/proc` in the private PID namespace, avoiding host procfs exposure
+and nested procfs-mount authority. It passes no GitHub token, askpass helper,
+App secret, SSH agent, or parent home to
 `coven-code`. Publication authority is minted only after the sandbox exits.
 Validation commands run again without credentials or network access. If the
 host cannot satisfy this boundary, leave real execution disabled and use demo
