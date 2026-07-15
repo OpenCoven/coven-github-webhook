@@ -1168,6 +1168,12 @@ test("distinguishes expected bounded review scope from material limitations", ()
     "High confidence; the review was bounded to the supplied changed files plus directly relevant supporting context, and no material limitation remains.",
   ), true);
   assert.equal(expectedReviewScopeStatement(
+    "High confidence. The changed file is directly malformed, and the failure is independently corroborated by syntax checking; no material limitation.",
+  ), true);
+  assert.equal(expectedReviewScopeStatement(
+    "No material limitation, but relevant dependency context was unavailable.",
+  ), false);
+  assert.equal(expectedReviewScopeStatement(
     "I reviewed only the changed file because relevant dependency context was unavailable.",
   ), false);
   assert.equal(expectedReviewScopeStatement(
